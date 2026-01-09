@@ -41,11 +41,206 @@ import tqdm
 import wandb
 
 import openpi.models.pi0_config
-import openpi.models_pytorch.pi0_pytorch
+import openpi.models_pytorch.g2vlm_pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
+from openpi.vlm_expert.dinov2_with_registers.configuration_dinov2_with_registers import Dinov2WithRegistersConfig
+from openpi.vlm_expert.dinov2_with_registers.modeling_dinov2_with_registers import Dinov2WithRegistersModel
+from openpi.vlm_expert.g2vlm.g2vlm import G2VLM
+from openpi.vlm_expert.g2vlm.g2vlm import G2VLMConfig
+from openpi.vlm_expert.g2vlm.qwen2vl import Qwen2VLForCausalLM
+from openpi.vlm_expert.qwen2.tokenization_qwen2 import Qwen2Tokenizer
+from openpi.vlm_expert.qwen2vl.configuration_qwen2_vl import Qwen2VLConfig
+from openpi.vlm_expert.qwen2vl.configuration_qwen2_vl import Qwen2VLVisionConfig
+from openpi.vlm_expert.qwen2vl.modeling_qwen2_vl import Qwen2VisionTransformerPretrainedModel
+from openpi.models_pytorch.omni_vla import OmniVLA
 
+from openpi.data_vlm.data_utils import add_special_tokens
+from openpi.data_vlm.transforms import QwenVL2ImageTransform
+from openpi.data_vlm.transforms import ImageTransform, InternVLImageTransform, QwenVL2ImageTransform
+from openpi.data_vlm.transforms_vggt import DinoImageTransform, DinoImageNormalizeTransform
+from safetensors.torch import load_file
+
+from openpi.vlm_expert.qwen2vl.modeling_qwen2_vl import Qwen2VisionTransformerPretrainedModel
+from openpi.vlm_expert.g2vlm.qwen2vl import Qwen2VLForCausalLM
+from openpi.vlm_expert.qwen2vl.configuration_qwen2_vl import Qwen2VLVisionConfig
+
+def load_model_and_tokenizer(model_path):
+    llm_config = Qwen2VLConfig.from_json_file(os.path.join(model_path, "text_config.json"))
+
+    llm_config.qk_norm = True
+    llm_config.tie_word_embeddings = False
+    llm_config.layer_module = 'Qwen2VLMoTDecoderLayer'  
+
+    vit_config = Qwen2VLVisionConfig.from_json_file(os.path.join(model_path, "vit_config.json"))
+    vit_config.patch_size =14
+
+    dino_config = Dinov2WithRegistersConfig.from_json_file(os.path.join(model_path, "dino_config.json"))
+
+    config = G2VLMConfig(
+        visual_und=True,
+        visual_recon=True, # Dino use
+        llm_config=llm_config, 
+        vit_config=vit_config,
+        dino_config=dino_config,
+        vit_max_num_patch_per_side=36,
+    )
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    language_model = Qwen2VLForCausalLM(llm_config).to(device)
+    vit_model      = Qwen2VisionTransformerPretrainedModel(vit_config).to(device)
+    dino_model = Dinov2WithRegistersModel(dino_config).to(device)
+
+    model = G2VLM(language_model, vit_model, dino_model, config)
+
+    tokenizer = Qwen2Tokenizer.from_pretrained(model_path)
+    tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
+
+    vit_image_transform = QwenVL2ImageTransform(768, 768, 14)
+    dino_transform = DinoImageNormalizeTransform(target_size=518)
+
+    model_state_dict_path = os.path.join(model_path, "model.safetensors")
+    model_state_dict = load_file(model_state_dict_path, device="cpu")
+    msg = model.load_state_dict(model_state_dict, strict=False)
+    print(msg)
+    del model_state_dict
+    model = model.cuda().eval()
+
+    return model, tokenizer, new_token_ids , vit_image_transform, dino_transform
+
+
+# Load G2VLM config from checkpoint directory
+def load_g2vlm_config_from_checkpoint(model_path: str) -> G2VLMConfig:
+    """
+    Load G2VLM configuration from checkpoint directory.
+    
+    Args:
+        model_path: Path to the G2VLM checkpoint directory containing:
+                   - text_config.json (for Qwen2VLConfig)
+                   - vit_config.json (for Qwen2VLVisionConfig)
+                   - dino_config.json (for Dinov2WithRegistersConfig)
+    
+    Returns:
+        G2VLMConfig object initialized from the config files
+    """
+    import json
+    
+    llm_config_path = os.path.join(model_path, "text_config.json")
+    vit_config_path = os.path.join(model_path, "vit_config.json")
+    dino_config_path = os.path.join(model_path, "dino_config.json")
+    
+    # Load LLM config
+    if os.path.exists(llm_config_path):
+        # Try from_json_file first, fallback to from_dict if not available
+        try:
+            llm_config = Qwen2VLConfig.from_json_file(llm_config_path)
+        except AttributeError:
+            # Fallback to loading JSON and using from_dict
+            with open(llm_config_path, 'r') as f:
+                llm_config_dict = json.load(f)
+            llm_config = Qwen2VLConfig.from_dict(llm_config_dict)
+        llm_config.qk_norm = True
+        llm_config.tie_word_embeddings = False
+        llm_config.layer_module = 'Qwen2VLMoTDecoderLayer'
+        logging.info(f"Loaded LLM config from {llm_config_path}")
+    else:
+        logging.warning(f"LLM config not found at {llm_config_path}, using default config")
+        llm_config = Qwen2VLConfig()
+        llm_config.qk_norm = True
+        llm_config.tie_word_embeddings = False
+        llm_config.layer_module = 'Qwen2VLMoTDecoderLayer'
+    
+    # Load VIT config
+    if os.path.exists(vit_config_path):
+        try:
+            vit_config = Qwen2VLVisionConfig.from_json_file(vit_config_path)
+        except AttributeError:
+            with open(vit_config_path, 'r') as f:
+                vit_config_dict = json.load(f)
+            vit_config = Qwen2VLVisionConfig.from_dict(vit_config_dict)
+        vit_config.patch_size = 14
+        logging.info(f"Loaded VIT config from {vit_config_path}")
+    else:
+        logging.warning(f"VIT config not found at {vit_config_path}, using default config")
+        vit_config = Qwen2VLVisionConfig()
+        vit_config.patch_size = 14
+    
+    # Load DINO config
+    if os.path.exists(dino_config_path):
+        try:
+            dino_config = Dinov2WithRegistersConfig.from_json_file(dino_config_path)
+        except AttributeError:
+            with open(dino_config_path, 'r') as f:
+                dino_config_dict = json.load(f)
+            dino_config = Dinov2WithRegistersConfig.from_dict(dino_config_dict)
+        logging.info(f"Loaded DINO config from {dino_config_path}")
+    else:
+        logging.warning(f"DINO config not found at {dino_config_path}, using default config")
+        dino_config = Dinov2WithRegistersConfig()
+    
+    # Create G2VLM config
+    g2vlm_config = G2VLMConfig(
+        visual_und=True,
+        visual_recon=True,
+        llm_config=llm_config,
+        vit_config=vit_config,
+        dino_config=dino_config,
+        vit_max_num_patch_per_side=36,
+    )
+    
+    return g2vlm_config
+
+
+# add local model weight
+def load_g2vlm_weights_from_checkpoint(model, model_path: str, device: torch.device):
+    """
+    Load pretrained G2VLM weights from a checkpoint directory.
+    
+    This function loads the G2VLM model weights from a safetensors file.
+    The model structure should already be initialized in OMNIPytorch.
+    
+    Args:
+        model: The OMNIPytorch model (may be wrapped in DDP)
+        model_path: Path to the G2VLM checkpoint directory containing model.safetensors
+        device: Target device
+    """
+    model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    g2vlm_model = model_to_load.g2vlm_with_expert.g2vlm
+    
+    model_state_dict_path = os.path.join(model_path, "model.safetensors")
+    
+    if not os.path.exists(model_state_dict_path):
+        raise FileNotFoundError(f"Model checkpoint not found at {model_state_dict_path}")
+    
+    # Load model state dict
+    logging.info(f"Loading G2VLM weights from {model_state_dict_path}")
+    model_state_dict = safetensors.torch.load_file(model_state_dict_path, device="cpu")
+    
+    # Load weights into G2VLM model
+    # The state dict should match the G2VLM model structure
+    # Use strict=False to allow for partial loading (e.g., if action_expert weights are not in the checkpoint)
+    msg = g2vlm_model.load_state_dict(model_state_dict, strict=False)
+    
+    logging.info(
+        f"Loaded G2VLM weights. Missing keys: {len(msg.missing_keys)}, Unexpected keys: {len(msg.unexpected_keys)}"
+    )
+    
+    if msg.missing_keys:
+        logging.warning(f"Missing keys (first 20): {msg.missing_keys[:20]}")
+        if len(msg.missing_keys) > 20:
+            logging.warning(f"... and {len(msg.missing_keys) - 20} more missing keys")
+    if msg.unexpected_keys:
+        logging.warning(f"Unexpected keys (first 20): {msg.unexpected_keys[:20]}")
+        if len(msg.unexpected_keys) > 20:
+            logging.warning(f"... and {len(msg.unexpected_keys) - 20} more unexpected keys")
+    
+    # Clean up
+    del model_state_dict
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    logging.info(f"Successfully loaded G2VLM pretrained weights from {model_path}")
 
 # add for wandb image logging
 def normalize_to_hwc(img: torch.Tensor, cam_name: str):
@@ -443,31 +638,53 @@ def train_loop(config: _config.TrainConfig):
         logging.info("Cleared sample batch and data loader from memory")
 
     # Build model
-    if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
-        # Convert dataclass to Pi0Config if needed
-        model_cfg = openpi.models.pi0_config.Pi0Config(
-            dtype=config.pytorch_training_precision,
-            action_dim=config.model.action_dim,
-            action_horizon=config.model.action_horizon,
-            max_token_len=config.model.max_token_len,
-            paligemma_variant=getattr(config.model, "paligemma_variant", "gemma_2b"),
-            action_expert_variant=getattr(config.model, "action_expert_variant", "gemma_300m"),
-            pi05=getattr(config.model, "pi05", False),
-        )
-    else:
-        model_cfg = config.model
-        # Update dtype to match pytorch_training_precision
-        object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    # if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
+    #     # Convert dataclass to Pi0Config if needed
+    #     model_cfg = openpi.models.pi0_config.Pi0Config(
+    #         dtype=config.pytorch_training_precision,
+    #         action_dim=config.model.action_dim,
+    #         action_horizon=config.model.action_horizon,
+    #         max_token_len=config.model.max_token_len,
+    #         paligemma_variant=getattr(config.model, "paligemma_variant", "gemma_2b"),
+    #         action_expert_variant=getattr(config.model, "action_expert_variant", "gemma_300m"),
+    #         pi05=getattr(config.model, "pi05", False),
+    #     )
+    # else:
+    #     model_cfg = config.model
+    #     # Update dtype to match pytorch_training_precision
+    #     object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    if hasattr(model, "gradient_checkpointing_enable"):
-        enable_gradient_checkpointing = True
-        model.gradient_checkpointing_enable()
-        logging.info("Enabled gradient checkpointing for memory optimization")
+    # model = openpi.models_pytorch.omni(OmniConfig=model_cfg).to(device)
+    model_cfg = config.model
+
+    # Load G2VLM config from checkpoint if provided, otherwise use default
+    if config.pytorch_weight_path is not None and os.path.exists(config.pytorch_weight_path):
+        logging.info(f"Loading G2VLM config from checkpoint: {config.pytorch_weight_path}")
+        vlm_config = load_g2vlm_config_from_checkpoint(config.pytorch_weight_path)
+        # Store weight path in config for SpatialVLMWithExpertModel to use
+        vlm_config.weight_path = config.pytorch_weight_path
     else:
-        enable_gradient_checkpointing = False
-        logging.info("Gradient checkpointing is not supported for this model")
+        logging.info("Using default G2VLM config")
+        vlm_config = G2VLMConfig()
+        vlm_config.weight_path = None
+    
+    # model = openpi.models_pytorch.omni.OMNIPytorch(config=model_cfg, g2config=vlm_config).to(device)
+    # g2_model, tokenizer, new_token_ids , vit_image_transform, dino_transform = load_model_and_tokenizer(config.pytorch_weight_path)
+    g2_model_path = config.pytorch_weight_path
+    g2_model_path = '/home/user/robot/model/G2VLM-2B-MoT'
+    model = OmniVLA(config=model_cfg, g2vlm_model=g2_model_path)
+
+    enable_gradient_checkpointing = False
+    model.gradient_checkpointing_disable()
+
+    # if hasattr(model, "gradient_checkpointing_enable"):
+    #     enable_gradient_checkpointing = True
+    #     model.gradient_checkpointing_enable()
+    #     logging.info("Enabled gradient checkpointing for memory optimization")
+    # else:
+    #     enable_gradient_checkpointing = False
+    #     logging.info("Gradient checkpointing is not supported for this model")
 
     # Log initial memory usage after model creation
     if is_main and torch.cuda.is_available():
@@ -491,15 +708,8 @@ def train_loop(config: _config.TrainConfig):
             static_graph=world_size >= 8,  # Enable for 8+ GPUs
         )
 
-    # Load weights from weight_loader if specified (for fine-tuning)
-    if config.pytorch_weight_path is not None:
-        logging.info(f"Loading weights from: {config.pytorch_weight_path}")
-
-        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
-        )
-        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+    # Note: G2VLM weights are now loaded automatically in SpatialVLMWithExpertModel.__init__
+    # if g2vlm_weight_path is provided in the config
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
@@ -559,6 +769,11 @@ def train_loop(config: _config.TrainConfig):
         else None
     )
 
+    # 打印一下看看，确保只有专家层和 Proj 层在训练
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(f"Training: {name}")
+
     while global_step < config.num_train_steps:
         # Set epoch for distributed training
         if use_ddp and hasattr(loader, "set_epoch"):
@@ -569,9 +784,12 @@ def train_loop(config: _config.TrainConfig):
             if global_step >= config.num_train_steps:
                 break
 
+            optim.zero_grad(set_to_none=True)
+
             # The unified data loader returns (observation, actions) tuple
-            observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
-            actions = actions.to(torch.float32)  # noqa: PLW2901
+            # observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
+            observation = jax.tree.map(lambda x: x.to(device).clone(), observation)
+            actions = actions.to(torch.bfloat16)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
 
             # Update LR
@@ -585,11 +803,34 @@ def train_loop(config: _config.TrainConfig):
                 losses = torch.stack(losses)
             elif not isinstance(losses, torch.Tensor):
                 losses = torch.tensor(losses, device=device, dtype=torch.float32)
+            
+            # --- 替换报错部分的 NaN 诊断代码 ---
+            if torch.isnan(losses).any():
+                print("\n" + "!"*50)
+                print("检测到 Loss 为 NaN! 正在自动诊断...")
+                
+                # 1. 检查 Actions 输入
+                if torch.isnan(actions).any():
+                    print("错误：输入 actions 包含 NaN")
+                
+                # 2. 检查模型参数梯度（如果是回传后 NaN）
+                for name, param in model.named_parameters():
+                    if param.grad is not None and torch.isnan(param.grad).any():
+                        print(f"梯度异常：层 {name} 的梯度包含 NaN")
+                
+                # 3. 检查 Attention Mask
+                # 建议在模型 forward 内部也打印一下 attention_mask.min()
+                
+                print("!"*50 + "\n")
+                # 抛出异常停止程序，防止污染之后的 checkpoint
+                raise RuntimeError("Stopping due to NaN loss")
 
             loss = losses.mean()
 
             # Backward pass
             loss.backward()
+
+            
 
             # Log memory usage after backward pass
             if global_step < 5 and is_main and torch.cuda.is_available():
@@ -597,7 +838,7 @@ def train_loop(config: _config.TrainConfig):
 
             # Gradient clipping
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
-
+            torch.cuda.empty_cache()
             # Optimizer step
             optim.step()
             optim.zero_grad(set_to_none=True)

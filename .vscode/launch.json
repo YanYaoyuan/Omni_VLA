@@ -1,0 +1,27 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+  {
+    "name": "Python: openpi train_test.py (FIXED)",
+    "type": "python",
+    "request": "launch",
+    "python": "/home/user/robot/openpi/.venv/bin/python",
+    "program": "${workspaceFolder}/scripts/train_omni.py",
+    "args": [
+        "pi0_libero_low_mem_finetune",
+        "--exp_name",
+        "pytorch_test"
+    ],
+    "env": {
+      "PYTHONPATH": "${workspaceFolder}",
+      "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.9",
+      "CUDA_VISIBLE_DEVICES": "1",
+      "TF_CPP_MIN_LOG_LEVEL": "0",
+      "TF_ENABLE_ONEDNN_OPTS": "0"
+    },
+    "console": "integratedTerminal",
+    "justMyCode": false,
+    "subProcess": true
+  }
+  ]
+}

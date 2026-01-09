@@ -1,15 +1,18 @@
 import logging
 import math
+from typing import Optional
 
 import torch
 from torch import Tensor
 from torch import nn
-import torch.nn.functional as F  # noqa: N812
+import torch.nn.functional as F
 
 import openpi.models.gemma as _gemma
+from openpi.models_pytorch.g2vlm_pi0_pytorch import G2VLMWithActorExpertModel
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
-
+from openpi.vlm_expert.g2vlm.g2vlm import G2VLMConfig
+from openpi.models.pi0_config import Pi0Config
 
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
@@ -23,7 +26,7 @@ def get_safe_dtype(target_dtype, device_type):
 
 
 def create_sinusoidal_pos_embedding(
-    time: torch.tensor, dimension: int, min_period: float, max_period: float, device="cpu"
+    time: Tensor, dimension: int, min_period: float, max_period: float, device="cpu"
 ) -> Tensor:
     """Computes sine-cosine positional embedding vectors for scalar positions."""
     if dimension % 2 != 0:
@@ -32,6 +35,7 @@ def create_sinusoidal_pos_embedding(
     if time.ndim != 1:
         raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
 
+    device = torch.device(device)
     dtype = get_safe_dtype(torch.float64, device.type)
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
     period = min_period * (max_period / min_period) ** fraction
@@ -81,43 +85,91 @@ def make_att_2d_masks(pad_masks, att_masks):
     return att_2d_masks & pad_2d_masks
 
 
-class PI0Pytorch(nn.Module):
-    def __init__(self, config):
+
+
+class OmniVLA(nn.Module):
+    def __init__(self, config: Pi0Config, g2vlm_model=None):
+        """
+        Initialize from PI0Pytorch model config.
+        
+        Args:
+            config: Configuration object
+            g2vlm_model: Optional pre-initialized G2VLM model. If provided, will use G2VLM instead of PaliGemma.
+        """
         super().__init__()
         self.config = config
-        self.pi05 = config.pi05
+        self.use_g2vlm = g2vlm_model is not None
 
-        paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
+        g2_path = g2vlm_model
 
-        self.paligemma_with_expert = PaliGemmaWithExpertModel(
-            paligemma_config,
-            action_expert_config,
-            use_adarms=[False, True] if self.pi05 else [False, False],
-            precision=config.dtype,
-        )
+        
 
-        self.action_in_proj = nn.Linear(32, action_expert_config.width)
-        self.action_out_proj = nn.Linear(action_expert_config.width, 32)
+        # Try to import G2VLM adapter
+        try:
+            from ..models_pytorch.g2vlm_pi0_pytorch import G2VLMWithActorExpertModel
+            G2VLM_AVAILABLE = True
+        except ImportError:
+            G2VLM_AVAILABLE = False
+            if g2vlm_model is not None:
+                raise ImportError("G2VLM adapter not available but g2vlm_model was provided")
 
-        if self.pi05:
-            self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
-            self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+        if self.use_g2vlm and G2VLM_AVAILABLE:
+            # Use G2VLM adapter
+            self.g2vlm_with_expert = G2VLMWithActorExpertModel(
+                g2_vlm_path=g2_path,
+                action_expert_config=action_expert_config
+            )
+            logging.info("Using G2VLM adapter for PI-0 VLA")
         else:
-            self.state_proj = nn.Linear(32, action_expert_config.width)
-            self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
-            self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+            # Use PaliGemma (original)
+            logging.info("Using PaliGemma adapter for PI-0 VLA")
 
-        torch.set_float32_matmul_precision("high")
-        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+
+        device = self.g2vlm_with_expert.g2vlm.device
+
+        for param in self.g2vlm_with_expert.g2vlm.dino_model.parameters():
+            param.requires_grad = False
+
+        for param in self.g2vlm_with_expert.g2vlm.vit_model.parameters():
+            param.requires_grad = False
+
+        for param in self.g2vlm_with_expert.g2vlm.language_model.parameters():
+            param.requires_grad = False
+
+        for param in self.g2vlm_with_expert.g2vlm.point_decoder.parameters():
+            param.requires_grad = False
+        
+        for param in self.g2vlm_with_expert.g2vlm.camera_decoder.parameters():
+            param.requires_grad = False
+
+        for param in self.g2vlm_with_expert.g2vlm.global_points_decoder.parameters():
+            param.requires_grad = False
+
+        hidden_size = self.g2vlm_with_expert.llm_config.hidden_size
+
+        self.action_in_proj = nn.Linear(32, hidden_size).to(device = device)
+        self.action_out_proj = nn.Linear(hidden_size, 32).to(device = device)
+
+        self.state_proj = nn.Linear(32, hidden_size).to(device = device)
+        self.action_time_mlp_in = nn.Linear(2 * hidden_size, hidden_size).to(device = device)
+        self.action_time_mlp_out = nn.Linear(hidden_size, hidden_size).to(device = device)
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
-        # msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
+        # # Compile model if requested
+        # if config.compile_model:
+        #     torch.set_float32_matmul_precision("high")
+        #     self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
+        #     # Also compile the main forward pass used during training
+        #     self.forward = torch.compile(self.forward, mode=config.compile_mode)
+
+        # msg = """An incorrect transformer version is used, please create an issue on https://github.com/huggingface/lerobot/issues"""
+
         # try:
         #     from transformers.models.siglip import check
-        # USE NEW Version
+
         #     if not check.check_whether_transformers_replace_is_installed_correctly():
         #         raise ValueError(msg)
         # except ImportError:
@@ -126,24 +178,34 @@ class PI0Pytorch(nn.Module):
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
-
+        if self.use_g2vlm:
+            # G2VLM uses different structure
+            self.g2vlm_with_expert.g2vlm.language_model.gradient_checkpointing = True
+            self.g2vlm_with_expert.g2vlm.vit_model.gradient_checkpointing = True
+        # Also enable for DINO model if it exists
+            self.g2vlm_with_expert.g2vlm.dino_model.gradient_checkpointing = True
+        else:
+            # PaliGemma structure
+            logging.info("Paligemma structure")
         logging.info("Enabled gradient checkpointing for PI0Pytorch model")
 
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing."""
         self.gradient_checkpointing_enabled = False
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
-
+        if self.use_g2vlm:
+            # G2VLM uses different structure
+            # G2VLM uses different structure
+            self.g2vlm_with_expert.g2vlm.language_model.gradient_checkpointing = True
+            self.g2vlm_with_expert.g2vlm.vit_model.gradient_checkpointing = True
+        # Also enable for DINO model if it exists
+            self.g2vlm_with_expert.g2vlm.dino_model.gradient_checkpointing = True
+        else:
+            # PaliGemma structure
+            logging.info("PaliGemma structure")
         logging.info("Disabled gradient checkpointing for PI0Pytorch model")
 
-    def is_gradient_checkpointing_enabled(self):
-        """Check if gradient checkpointing is enabled."""
-        return self.gradient_checkpointing_enabled
+    def _rtc_enabled(self):
+        return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
@@ -157,9 +219,20 @@ class PI0Pytorch(nn.Module):
         """Helper method to prepare 4D attention masks for transformer."""
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
         return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
-
+    
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
+        observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
+        return (
+            list(observation.images.values()),
+            list(observation.image_masks.values()),
+            observation.tokenized_prompt,
+            observation.tokenized_prompt_mask,
+            observation.state,
+        )
+        
+    def _preprocess_observation_g2vlm(self, observation, *, train=True):
+        """Helper method to preprocess observation for G2VLM."""
         observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
         return (
             list(observation.images.values()),
@@ -179,48 +252,61 @@ class PI0Pytorch(nn.Module):
         )
 
     def sample_time(self, bsize, device):
-        time_beta = sample_beta(1.5, 1.0, bsize, device)
+        time_beta = sample_beta(
+            1.5, 1.0, bsize, device
+        )
         time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
 
-    def embed_prefix(
+    def embed_vlm_context(self, images, lang_tokens):
+        """调用 G2VLM 获取双流融合特征 [3, 4]"""
+        # G2VLM 会自动路由图像 Token 到语义和几何专家路径，并执行共享自注意力
+        outputs = self.g2vlm_with_expert.g2vlm(
+            input_ids=lang_tokens,
+            pixel_values=images,
+            output_hidden_states=True
+        )
+        # 获取最后的隐藏状态作为动作头的 context
+        # 这里包含了 G2VLM 预测的点云几何特征和语义特征
+        return outputs.last_hidden_state
+
+    def embed_prefix_old(
         self, images, img_masks, lang_tokens, lang_masks
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed images with SigLIP and language tokens with embedding layer to prepare
-        for PaliGemma transformer processing.
-        """
+        """Embed images with SigLIP and language tokens with embedding layer."""
         embs = []
         pad_masks = []
         att_masks = []
+        
+        print(type(images), len(images))
+        print(images[0].shape, images[0].dtype, images[0].min(), images[0].max())
+
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
 
             def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
+                return self.g2vlm_with_expert.embed_image(img)
 
-            img_emb = self._apply_checkpoint(image_embed_func, img)
-
+            # img_emb = self._apply_checkpoint(image_embed_func, img)
+            #mg_emb = image_embed_func(img)
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
-
-            # Create attention masks so that image tokens attend to each other
             att_masks += [0] * num_img_embs
 
         # Process language tokens
         def lang_embed_func(lang_tokens):
-            lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
+            lang_emb = self.g2vlm_with_expert.embed_language_tokens(lang_tokens)
             lang_emb_dim = lang_emb.shape[-1]
             return lang_emb * math.sqrt(lang_emb_dim)
 
-        lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
-
+        # lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
+        lang_emb = lang_embed_func(lang_tokens=lang_tokens)
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
 
-        # full attention between image and language inputs
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
@@ -228,11 +314,69 @@ class PI0Pytorch(nn.Module):
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
 
-        # Get batch size from the first dimension of the concatenated tensors
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
         return embs, pad_masks, att_masks
+    
+    def embed_prefix(self, images, img_masks, lang_tokens, lang_masks):
+        embs = []
+        pad_masks = []
+        att_masks = []
+        token_type_ids = []
+
+        batch_size = lang_tokens.size(0)  # 以语言 token batch 为标准
+
+        # Process images
+        for img, img_mask in zip(images, img_masks):
+            def image_embed_func(img):
+                return self.g2vlm_with_expert.embed_image(img)
+            img_emb_dict = self._apply_checkpoint(image_embed_func, img)
+            semantic_tokens = img_emb_dict["semantic"]
+            geometric_tokens = img_emb_dict["geometric"]
+
+            # --- 🚀 诊断点 1：视觉分支 ---
+            print(f"DEBUG [Layer: Input]: semantic_tokens max: {semantic_tokens.abs().max().item():.4f}")
+            print(f"DEBUG [Layer: Input]: geometric_tokens max: {geometric_tokens.abs().max().item():.4f}")
+
+            # expand batch to match language tokens batch
+            if semantic_tokens.size(0) != batch_size:
+                semantic_tokens = semantic_tokens.expand(batch_size, -1, -1)
+            if geometric_tokens.size(0) != batch_size:
+                geometric_tokens = geometric_tokens.expand(batch_size, -1, -1)
+
+            embs.extend([semantic_tokens, geometric_tokens])
+            pad_masks.extend([
+                img_mask[:, None].expand(semantic_tokens.size(0), semantic_tokens.size(1)),
+                img_mask[:, None].expand(geometric_tokens.size(0), geometric_tokens.size(1))
+            ])
+            att_masks.extend([0] * (semantic_tokens.size(1) + geometric_tokens.size(1)))
+            # token type
+            token_type_ids.extend([0] * semantic_tokens.size(1))  # semantic
+            token_type_ids.extend([1] * geometric_tokens.size(1)) # geometric
+
+
+        # Process language tokens
+        lang_emb = self.g2vlm_with_expert.embed_language_tokens(lang_tokens)
+        # --- 🚀 诊断点 2：语言 Embedding ---
+        print(f"DEBUG [Layer: Input]: lang_emb (pre-scale) max: {lang_emb.abs().max().item():.4f}")
+        lang_emb = lang_emb * math.sqrt(lang_emb.size(-1))
+        print(f"DEBUG [Layer: Input]: lang_emb (post-scale) max: {lang_emb.abs().max().item():.4f}")
+
+        embs.append(lang_emb)
+        pad_masks.append(lang_masks)
+        att_masks.extend([0] * lang_emb.size(1))
+        token_type_ids.extend([2] * lang_emb.size(1))
+
+        # concat along token dimension
+        prefix_embeds = torch.cat(embs, dim=1)           # [B, N, D]
+        prefix_pad_masks = torch.cat(pad_masks, dim=1)   # [B, N]
+        prefix_att_masks = torch.tensor(att_masks, dtype=torch.bool, device=prefix_pad_masks.device)
+        prefix_att_masks = prefix_att_masks[None, :].expand(batch_size, len(att_masks))
+        prefix_token_type_ids = torch.tensor(token_type_ids, dtype=torch.long, device=prefix_pad_masks.device)
+        prefix_token_type_ids = prefix_token_type_ids[None, :].expand(batch_size, len(token_type_ids))
+
+        return prefix_embeds, prefix_pad_masks, prefix_att_masks, prefix_token_type_ids
 
     def embed_suffix(self, state, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
@@ -240,65 +384,57 @@ class PI0Pytorch(nn.Module):
         pad_masks = []
         att_masks = []
 
-        if not self.pi05:
-            if self.state_proj.weight.dtype == torch.float32:
-                state = state.to(torch.float32)
+        device = self.state_proj.weight.device
+        if state.dtype != self.state_proj.weight.dtype or state.device != device:
+            state = state.to(dtype=self.state_proj.weight.dtype, device=device)
 
-            # Embed state
-            def state_proj_func(state):
-                return self.state_proj(state)
+        def state_proj_func(state):
+            return self.state_proj(state)
 
-            state_emb = self._apply_checkpoint(state_proj_func, state)
+        state_emb = self._apply_checkpoint(state_proj_func, state)
+        embs.append(state_emb[:, None, :])
+        bsize = state_emb.shape[0]
+        # device = state_emb.device
 
-            embs.append(state_emb[:, None, :])
-            bsize = state_emb.shape[0]
-            device = state_emb.device
+        state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
+        pad_masks.append(state_mask)
+        att_masks += [1]
 
-            state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
-            pad_masks.append(state_mask)
-
-            # Set attention masks so that image and language inputs do not attend to state or actions
-            att_masks += [1]
-
+        # Embed timestep using sine-cosine positional encoding
         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = create_sinusoidal_pos_embedding(
             timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0, device=timestep.device
         )
         time_emb = time_emb.type(dtype=timestep.dtype)
 
+        if noisy_actions.dtype != self.action_in_proj.weight.dtype or noisy_actions.device != device:
+            noisy_actions = noisy_actions.to(dtype=self.action_in_proj.weight.dtype, device=device)
+
+
         # Fuse timestep + action information using an MLP
         def action_proj_func(noisy_actions):
             return self.action_in_proj(noisy_actions)
+        
+
 
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
 
-        if not self.pi05:
-            time_emb = time_emb[:, None, :].expand_as(action_emb)
-            action_time_emb = torch.cat([action_emb, time_emb], dim=2)
+        if action_emb.device != device:
+            action_emb = action_emb.to(device = device)
+        
 
-            # Apply MLP layers
-            def mlp_func(action_time_emb):
-                x = self.action_time_mlp_in(action_time_emb)
-                x = F.silu(x)  # swish == silu
-                return self.action_time_mlp_out(x)
+        time_emb = time_emb[:, None, :].expand_as(action_emb)
+        action_time_emb = torch.cat([action_emb, time_emb], dim=2)
 
-            action_time_emb = self._apply_checkpoint(mlp_func, action_time_emb)
-            adarms_cond = None
-        else:
-            # time MLP (for adaRMS)
-            def time_mlp_func(time_emb):
-                x = self.time_mlp_in(time_emb)
-                x = F.silu(x)  # swish == silu
-                x = self.time_mlp_out(x)
-                return F.silu(x)
+        def mlp_func(action_time_emb):
+            x = self.action_time_mlp_in(action_time_emb)
+            x = F.silu(x)
+            return self.action_time_mlp_out(x)
 
-            time_emb = self._apply_checkpoint(time_mlp_func, time_emb)
-            action_time_emb = action_emb
-            adarms_cond = time_emb
+        action_time_emb = self._apply_checkpoint(mlp_func, action_time_emb)
+        adarms_cond = None
 
-        # Add to input tokens
         embs.append(action_time_emb)
-
         bsize, action_time_dim = action_time_emb.shape[:2]
         action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
         pad_masks.append(action_time_mask)
@@ -313,6 +449,28 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
+    def embed_suffix2(self, state, noisy_actions, timestep):
+        """PI0 的动作与状态特征提取逻辑 """
+        # 状态嵌入
+        state_emb = self.state_proj(state.to(self.g2vlm.dtype)) #
+        
+        # 时间嵌入 (Sinusoidal)
+        time_emb = create_sinusoidal_pos_embedding(
+            timestep, self.hidden_size, device=timestep.device
+        ).to(self.g2vlm.dtype)
+        
+        # 动作嵌入
+        action_emb = self.action_in_proj(noisy_actions) #
+        
+        # 融合时间与动作 (PI0 经典 MLP 结构)
+        time_expanded = time_emb[:, None, :].expand_as(action_emb)
+        action_time_emb = torch.cat([action_emb, time_expanded], dim=-1)
+        
+        x = F.silu(self.action_time_mlp_in(action_time_emb))
+        suffix_embs = self.action_time_mlp_out(x)
+        
+        return suffix_embs, state_emb
+
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
@@ -326,15 +484,18 @@ class PI0Pytorch(nn.Module):
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
-
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        
+        
+        
+        prefix_embs, prefix_pad_masks, prefix_att_masks, prefix_token_type_ids  = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+            self.g2vlm_with_expert.g2vlm.language_model.base_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
         ):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+            
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -347,7 +508,7 @@ class PI0Pytorch(nn.Module):
 
         # Apply gradient checkpointing if enabled
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+            (_, suffix_out), _ = self.g2vlm_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
@@ -388,9 +549,11 @@ class PI0Pytorch(nn.Module):
 
         # Compute image and language key value cache
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        # Set attention implementation (only for PaliGemma)
+        if not self.use_g2vlm:
+            self.g2vlm_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        _, past_key_values = self.paligemma_with_expert.forward(
+        _, past_key_values = self.g2vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -444,9 +607,11 @@ class PI0Pytorch(nn.Module):
 
         # Prepare attention masks
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+        # Set attention implementation (only for PaliGemma)
+        if not self.use_g2vlm:
+            self.g2vlm_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        outputs_embeds, _ = self.paligemma_with_expert.forward(
+        outputs_embeds, _ = self.g2vlm_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
             past_key_values=past_key_values,

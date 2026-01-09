@@ -1,0 +1,40 @@
+
+recon_then_und:
+  dataset_names:
+  - spatial_mix
+  dino_image_transform_args:
+    # image_stride: 14
+    # max_image_size: 518
+    # min_image_size: 518
+    # max_pixels: 2_007_040
+    # mode='crop'
+    target_size: 518
+  vit_image_transform_args:
+    image_stride: 14
+    image_size_h: 768  
+    image_size_w: 768 
+    max_pixels: 2_007_040
+  is_mandatory: True 
+  num_used_data:
+  # - 100000
+  - 10
+  weight: 1
+
+
+vlm_sft:
+  dataset_names:
+  - llava_ov
+  vit_image_transform_args:
+    image_stride: 14
+    image_size_h: 768
+    image_size_w: 768
+    max_pixels: 2_007_040
+  frame_sampler_args:
+    max_num_frames: 12
+    min_num_frames: 8
+  is_mandatory: True
+  shuffle_lines: True
+  shuffle_seed: 0
+  num_used_data:
+  - 3628218
+  weight: 1
