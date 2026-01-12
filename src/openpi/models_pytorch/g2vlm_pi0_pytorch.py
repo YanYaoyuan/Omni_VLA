@@ -95,6 +95,81 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
+def apply_mrope_to_expert(q, k, cos, sin):
+    """
+    针对 Qwen2-VL 的 M-RoPE 逻辑：将 head_dim 拆分为 T, H, W 三部分分别旋转
+    q, k: [Batch, Heads, Seq, Dim]
+    cos, sin: [3, Batch, Seq, Dim] (由 rope_module 生成)
+    """
+    # 1. 按照 Qwen2-VL 官方比例拆分 head_dim (1/2, 1/4, 1/4)
+    dim = cos.shape[-1]
+    m_cos = torch.cat([
+        cos[0, ..., :dim//2],          # Temporal
+        cos[1, ..., dim//2:3*dim//4],    # Height
+        cos[2, ..., 3*dim//4:]           # Width
+    ], dim=-1)
+    
+    m_sin = torch.cat([
+        sin[0, ..., :dim//2],
+        sin[1, ..., dim//2:3*dim//4],
+        sin[2, ..., 3*dim//4:]
+    ], dim=-1)
+
+    # 2. 增加 Heads 维度用于广播: [B, 1, L, D]
+    m_cos = m_cos.unsqueeze(1)
+    m_sin = m_sin.unsqueeze(1)
+
+    # 3. 执行旋转 (FP32 计算以保稳)
+    q_out = (q.float() * m_cos) + (rotate_half(q.float()) * m_sin)
+    k_out = (k.float() * m_cos) + (rotate_half(k.float()) * m_sin)
+    
+    return q_out.to(q.dtype), k_out.to(k.dtype)
+
+
+# Add 20250110
+def apply_rotary_pos_emb_vision_3d(q, k, cos, sin):
+    """
+    针对 Qwen2-VL M-RoPE 的 3D 旋转应用
+    q, k: [Batch, Heads, Seq, Dim]
+    cos, sin: [3, Batch, Seq, Dim] (由 rope_module 生成)
+    """
+    # 1. 维度对齐：将 cos/sin 插入 Heads 维度以便广播 [3, B, 1, L, D]
+    cos = cos.unsqueeze(2)
+    sin = sin.unsqueeze(2)
+    
+    # 2. 核心逻辑：Qwen2-VL 将 head_dim 拆分为 T, H, W 三部分
+    # 通常比例为: T(1/2), H(1/4), W(1/4)
+    dim = q.shape[-1]
+    
+    # 构造混合旋转矩阵
+    # 这种方式保证了 q 的不同通道分别吸收了不同轴的位置信息
+    m_cos = torch.cat([
+        cos[0, ..., :dim//2],          # 时间分量旋转前一半维度
+        cos[1, ..., dim//2:3*dim//4],    # 高度分量旋转中间 1/4
+        cos[2, ..., 3*dim//4:]           # 宽度分量旋转最后 1/4
+    ], dim=-1)
+    
+    m_sin = torch.cat([
+        sin[0, ..., :dim//2],
+        sin[1, ..., dim//2:3*dim//4],
+        sin[2, ..., 3*dim//4:]
+    ], dim=-1)
+
+    # 3. 执行旋转计算
+    def rotate_half(x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    # 提升精度计算防止 NaN
+    orig_dtype = q.dtype
+    q, k = q.float(), k.float()
+    
+    q_embed = (q * m_cos) + (rotate_half(q) * m_sin)
+    k_embed = (k * m_cos) + (rotate_half(k) * m_sin)
+    
+    return q_embed.to(orig_dtype), k_embed.to(orig_dtype)
+
 def get_rope_index_for_hidden(attention_mask: torch.Tensor):
     """
     Returns position_ids of shape (batch, seq_len) compatible with rotary_emb
@@ -213,6 +288,8 @@ class G2VLMWithActorExpertModel(nn.Module):
         self.action_expert = GemmaForCausalLM(config=action_expert_config_hf).to(device = device)
         self.action_expert.model.embed_tokens = None  # We'll use shared embeddings
 
+        self.action_gate = nn.Parameter(torch.ones(28))
+
         # action_expert_config_hf = Qwen2Config(
         #     hidden_size=llm_config.hidden_size,
         #     intermediate_size=action_expert_config.mlp_dim,
@@ -275,7 +352,11 @@ class G2VLMWithActorExpertModel(nn.Module):
             {
                 "semantic":  Tensor[B, N_vit, D],
                 "geometric": Tensor[B, N_dino, D],
+                "vit_grid":  Tensor[1, 3],  # [T, H, W]
+                "dino_grid": Tensor[1, 3],  # [T, H, W]
             }
+
+        Add 20250110: 返回 grid grid_thw 信息
         """
 
         # --- 🚀 核心诊断：检查输入像素 ---
@@ -311,6 +392,7 @@ class G2VLMWithActorExpertModel(nn.Module):
 
         vit_pixel_values = vit_pixel_values.to(device=device, dtype=dtype)
         image_grid_thw = image_grid_thw.to(device=device)
+        vit_grid_thw = image_grid_thw.to(device=device)
 
         # 1.3 一次 forward 拿特征
         vit_feats = self.visiontower(vit_pixel_values, grid_thw=image_grid_thw)  # [B, N_vit, D]
@@ -323,6 +405,18 @@ class G2VLMWithActorExpertModel(nn.Module):
 
         B, C, H, W = dino_images.shape
         patch_size = self.dinoTower.config.patch_size  # 例如 16
+
+
+        patch_size = self.dinoTower.config.patch_size
+        dino_h_tokens = dino_images.shape[2] // patch_size
+        dino_w_tokens = dino_images.shape[3] // patch_size
+        # 构造符合 Qwen2-VL 格式的 grid_thw: [T, H, W]
+        # 注意：这里假设是单张图，如果是视频需要根据 B 调整，但在 VLA 中通常 B 放在外面
+        dino_grid_thw = torch.tensor(
+            [[1, dino_h_tokens, dino_w_tokens]], 
+            device=dino_images.device, 
+            dtype=torch.int32
+        )
 
         num_tokens_per_image = (H // patch_size) * (W // patch_size)  # 每张图的 token 数
         cu_seqlens = torch.arange(0, B * num_tokens_per_image + 1, num_tokens_per_image, 
@@ -349,6 +443,8 @@ class G2VLMWithActorExpertModel(nn.Module):
         return {
             "semantic": vit_feats,      # [B, N_vit, D]
             "geometric": geometric_tokens,  # [B, N_dino, D]
+            "vit_grid": vit_grid_thw[0],   # [1, 3] -> 用于 build_3d_position_ids
+            "dino_grid": dino_grid_thw[0], # [1, 3] -> 用于 build_3d_position_ids
         }
 
 
@@ -586,15 +682,7 @@ class G2VLMWithActorExpertModel(nn.Module):
                 print("Fixed value_states Shape:", value_states.shape)
 
 
-                dummy_tensor = torch.zeros(
-                    query_states.shape[0],
-                    query_states.shape[2],
-                    query_states.shape[-1],
-                    device=query_states.device,
-                    dtype=query_states.dtype,
-                )
-
-
+                # 1. 获取 3D 旋转频率
                 rope_module = models[0].base_model.layers[0].self_attn.rotary_emb
 
                 prefix_len = inputs_embeds[0].shape[1]
@@ -617,14 +705,34 @@ class G2VLMWithActorExpertModel(nn.Module):
                     cos, sin = rope_module(value_states, position_ids)
                     print(f"Cos max: {cos.max()}, Sin max: {sin.max()}") # 👈 检查这里
 
-                # from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_rotary_pos_emb as apply_mrope
-                
-                query_states, key_states = apply_rotary_pos_emb(
-                    query_states, 
-                    key_states, 
-                    cos, 
+
+                # # 1. Handle M-RoPE 5D output (if it returns the 3-axis components)模型会丢失高度和宽度的空间坐标 
+                # if cos.dim() == 5:
+                #     # Most apply_rotary_pos_emb functions expect 4D.
+                #     # Usually, we take index 0 or use a specific M-RoPE helper.
+                #     cos = cos[0]
+                #     sin = sin[0]
+
+                # # 2. FORCE the head dimension to be 1 for broadcasting
+                # # If shape is [Batch, 2, Seq, Dim], we want [Batch, 1, Seq, Dim]
+                # if cos.shape[1] != 1:
+                #     # We take only the first slice because RoPE is identical across heads
+                #     cos = cos[:, :1, :, :]
+                #     sin = sin[:, :1, :, :]
+
+                print(f"Broadcast-ready Cos shape: {cos.shape}")
+
+                # 2. 应用 3D M-RoPE
+                query_states, key_states = apply_rotary_pos_emb_vision_3d(
+                    query_states,
+                    key_states,
+                    cos,
                     sin
                 )
+                # q_embed, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
+                # _, k_embed = apply_rotary_pos_emb(key_states, key_states, cos, sin)
+                # query_states = q_embed
+                # key_states = k_embed
 
                 print(f"Q max: {query_states.max()}, K max: {key_states.max()}")
 
@@ -645,35 +753,35 @@ class G2VLMWithActorExpertModel(nn.Module):
                 print(value_states.shape)
                 print(attention_mask.shape)
 
-                if query_states.dim() == 5:
-                    # Qwen2-VL 的 apply_mrope 可能会保留 3D 维度。
-                    # 实际上 M-RoPE 已经完成了旋转，我们只需要取其中一个分量或者对齐维度。
-                    # 在标准实现中，旋转是原位的，我们通过 view 把它压回 4 维。
-                    # 注意：这里取 query_states[0] 是不行的，因为三个分量分别旋转了不同的 head 部分。
-                    # 正确做法是 view 成 4 维，因为 num_heads 已经包含了所有的信息。
+                # if query_states.dim() == 5:
+                #     # Qwen2-VL 的 apply_mrope 可能会保留 3D 维度。
+                #     # 实际上 M-RoPE 已经完成了旋转，我们只需要取其中一个分量或者对齐维度。
+                #     # 在标准实现中，旋转是原位的，我们通过 view 把它压回 4 维。
+                #     # 注意：这里取 query_states[0] 是不行的，因为三个分量分别旋转了不同的 head 部分。
+                #     # 正确做法是 view 成 4 维，因为 num_heads 已经包含了所有的信息。
                     
-                    b_size = value_states.shape[0] # 真实的 Batch Size (1)
+                #     b_size = value_states.shape[0] # 真实的 Batch Size (1)
                     
-                    # 检查 query_states 的总维度是否匹配
-                    # 如果是 [3, B, H, L, D]，通常 Qwen 会在内部把 H 切分，
-                    # 但如果 apply_mrope 返回的是 5 维，说明它没有自动 squeeze。
-                    query_states = query_states[0]
-                    key_states = key_states[0]
-                    # query_states = query_states.view(batch_size, num_heads, seq_len, head_dim)
-                    # key_states = key_states.view(batch_size, num_heads, seq_len, head_dim)
+                #     # 检查 query_states 的总维度是否匹配
+                #     # 如果是 [3, B, H, L, D]，通常 Qwen 会在内部把 H 切分，
+                #     # 但如果 apply_mrope 返回的是 5 维，说明它没有自动 squeeze。
+                #     query_states = query_states[0]
+                #     key_states = key_states[0]
+                #     # query_states = query_states.view(batch_size, num_heads, seq_len, head_dim)
+                #     # key_states = key_states.view(batch_size, num_heads, seq_len, head_dim)
                     
 
-                    # 再次打印确认，应该是 [1, 12, 1059, 128] 这种 4 维格式
-                    print("Fixed Query Shape:", query_states.shape)
-                    print("Fixed key Shape:", key_states.shape)
+                #     # 再次打印确认，应该是 [1, 12, 1059, 128] 这种 4 维格式
+                #     print("Fixed Query Shape:", query_states.shape)
+                #     print("Fixed key Shape:", key_states.shape)
 
-                # 确保是 4D 且维度对齐
-                batch_size = value_states.shape[0]
-                seq_len = value_states.shape[2]
+                # # 确保是 4D 且维度对齐
+                # batch_size = value_states.shape[0]
+                # seq_len = value_states.shape[2]
 
-                # 强制指定维度，防止 view 自动相乘
-                query_states = query_states.reshape(batch_size, 12, seq_len, 128)
-                key_states = key_states.reshape(batch_size, 2, seq_len, 128)
+                # # 强制指定维度，防止 view 自动相乘
+                # query_states = query_states.reshape(batch_size, 12, seq_len, 128)
+                # key_states = key_states.reshape(batch_size, 2, seq_len, 128)
 
                 # 打印一下确认：应该是 [1, 12, 1059, 128] 和 [1, 2, 1059, 128]
                 print(f"Final Q: {query_states.shape}, K: {key_states.shape}")

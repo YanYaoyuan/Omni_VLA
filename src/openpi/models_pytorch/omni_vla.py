@@ -14,6 +14,9 @@ import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 from openpi.vlm_expert.g2vlm.g2vlm import G2VLMConfig
 from openpi.models.pi0_config import Pi0Config
 
+from ..data_vlm.data_utils import get_rope_index_image_3D
+from ..data_vlm.data_utils import get_rope_index_image_3D_dino
+
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
     if device_type == "cpu":
@@ -87,6 +90,7 @@ def make_att_2d_masks(pad_masks, att_masks):
 
 
 
+
 class OmniVLA(nn.Module):
     def __init__(self, config: Pi0Config, g2vlm_model=None):
         """
@@ -127,6 +131,8 @@ class OmniVLA(nn.Module):
 
 
         device = self.g2vlm_with_expert.g2vlm.device
+
+        # need modify
 
         for param in self.g2vlm_with_expert.g2vlm.dino_model.parameters():
             param.requires_grad = False
@@ -325,6 +331,10 @@ class OmniVLA(nn.Module):
         att_masks = []
         token_type_ids = []
 
+        # Add 20250110: 
+        self.current_vit_grid = []  # 新增：用于存储 ViT 的 grid_thw
+        self.current_dino_grid = [] # 新增：用于存储 DINO 的 grid_thw
+
         batch_size = lang_tokens.size(0)  # 以语言 token batch 为标准
 
         # Process images
@@ -334,6 +344,10 @@ class OmniVLA(nn.Module):
             img_emb_dict = self._apply_checkpoint(image_embed_func, img)
             semantic_tokens = img_emb_dict["semantic"]
             geometric_tokens = img_emb_dict["geometric"]
+
+            # Add 20250110: 
+            self.current_vit_grid.append(img_emb_dict["vit_grid"]) 
+            self.current_dino_grid.append(img_emb_dict["dino_grid"])
 
             # --- 🚀 诊断点 1：视觉分支 ---
             print(f"DEBUG [Layer: Input]: semantic_tokens max: {semantic_tokens.abs().max().item():.4f}")
@@ -449,27 +463,6 @@ class OmniVLA(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def embed_suffix2(self, state, noisy_actions, timestep):
-        """PI0 的动作与状态特征提取逻辑 """
-        # 状态嵌入
-        state_emb = self.state_proj(state.to(self.g2vlm.dtype)) #
-        
-        # 时间嵌入 (Sinusoidal)
-        time_emb = create_sinusoidal_pos_embedding(
-            timestep, self.hidden_size, device=timestep.device
-        ).to(self.g2vlm.dtype)
-        
-        # 动作嵌入
-        action_emb = self.action_in_proj(noisy_actions) #
-        
-        # 融合时间与动作 (PI0 经典 MLP 结构)
-        time_expanded = time_emb[:, None, :].expand_as(action_emb)
-        action_time_emb = torch.cat([action_emb, time_expanded], dim=-1)
-        
-        x = F.silu(self.action_time_mlp_in(action_time_emb))
-        suffix_embs = self.action_time_mlp_out(x)
-        
-        return suffix_embs, state_emb
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
@@ -495,16 +488,38 @@ class OmniVLA(nn.Module):
         ):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
-            
 
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        # Add 20250110
+        # 收集构造 3D 索引所需的元数据
+        prefix_info = {
+            'batch_size': prefix_embs.shape[0],
+            'device': prefix_embs.device,
+            # 使用 torch.prod 计算 T*H*W，再 sum 起来
+            'vit_len': sum([torch.prod(g).item() for g in self.current_vit_grid]), 
+            'dino_len': sum([torch.prod(g).item() for g in self.current_dino_grid]),
+            'text_len': lang_tokens.shape[1],
+            'vit_grid': self.current_vit_grid,
+            'dino_grid': self.current_dino_grid
+        }
 
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        print(f"DEBUG: prefix_embs shape: {prefix_embs.shape}")
+        print(f"DEBUG: suffix_embs shape: {suffix_embs.shape}")
+        print(f"DEBUG: vit_grid count: {len(self.current_vit_grid)}")
+        print(f"DEBUG: dino_grid count: {len(self.current_dino_grid)}")
+        position_ids = self.build_3d_position_ids(prefix_info, suffix_embs.shape[1])
 
-        # Prepare attention masks
-        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+        # --- 🚀 核心修改点：混合因果掩码 ---
+        # 替换原有的 make_att_2d_masks，注入 PI-0 的因果逻辑
+        att_2d_masks_4d = self.build_pi0_attention_mask(prefix_pad_masks, suffix_embs.shape[1])
+
+        # pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        # att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+
+        # att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        # position_ids = torch.cumsum(pad_masks, dim=1) - 1
+
+        # # Prepare attention masks
+        # att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
         # Apply gradient checkpointing if enabled
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
@@ -624,3 +639,100 @@ class OmniVLA(nn.Module):
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         return self.action_out_proj(suffix_out)
+    
+    # Add 20250110
+    # 把这些分散的 grid_thw 拼成一个完整的 3D 坐标系
+    def build_3d_position_ids(self, prefix_info, suffix_len):
+        b = prefix_info['batch_size']
+        device = prefix_info['device']
+        curr_pos_val = 0  # 建议换个变量名，避免混淆
+
+        # 1. 语义索引 (ViT)
+        all_vit_pos = []
+        for grid in prefix_info['vit_grid']:
+            # 🚀 修复点：将 curr_pos 改为 curr_position_id
+            # pos_3d, delta = get_rope_index_image_3D(
+            #     grid.flatten(), 
+            #     curr_position_id=curr_pos_val 
+            # )
+            pos_3d, delta = get_rope_index_image_3D(grid.flatten()[:3], curr_position_id=curr_pos_val)
+            all_vit_pos.append(pos_3d.unsqueeze(1).repeat(1, b, 1))
+            curr_pos_val += int(delta) + 1
+
+        # 2. 几何索引 (DINO)
+        all_dino_pos = []
+        for grid in prefix_info['dino_grid']:
+            # 🚀 同样修复这里的参数名
+            # pos_3d, delta = get_rope_index_image_3D_dino(
+            #     grid.flatten(), 
+            #     curr_position_id=curr_pos_val
+            # )
+            pos_3d, delta = get_rope_index_image_3D(grid.flatten()[:3], curr_position_id=curr_pos_val)
+            all_dino_pos.append(pos_3d.unsqueeze(1).repeat(1, b, 1))
+            curr_pos_val += int(delta) + 1
+
+        # # 3. 文本与动作 (线性 T 轴)
+        # text_act_len = prefix_info['text_len'] + suffix_len
+        # # 从最后的 curr_pos_val 开始递增
+        # incremental_ids = torch.arange(curr_pos_val, curr_pos_val + text_act_len, device=device)
+        
+        # t_axis = incremental_ids.unsqueeze(0).repeat(b, 1)
+        # h_axis = torch.zeros_like(t_axis)
+        # w_axis = torch.zeros_like(t_axis)
+        # text_act_pos = torch.stack([t_axis, h_axis, w_axis], dim=0)
+
+        # # 4. 拼接全序列
+        # full_vit_pos = torch.cat(all_vit_pos, dim=-1)
+        # full_dino_pos = torch.cat(all_dino_pos, dim=-1)
+
+        # 3. 文本索引
+        # 💡 这里要动态计算文本的真实长度，防止 text_len 不准
+        # 总 prefix 长度 - 已分配的视觉长度 = 文本长度
+        current_vision_len = sum([p.shape[-1] for p in all_vit_pos]) + sum([p.shape[-1] for p in all_dino_pos])
+        actual_prefix_len = 2352 # 建议从外部传入 prefix_embs.shape[1]
+        text_len = actual_prefix_len - current_vision_len
+        
+        # 4. 拼接文本和动作 (Suffix)
+        total_incremental_len = text_len + suffix_len
+        incremental_ids = torch.arange(curr_pos_val, curr_pos_val + total_incremental_len, device=device)
+        text_act_pos = incremental_ids.unsqueeze(0).unsqueeze(0).repeat(3, b, 1)
+
+        # 5. 拼接全序列
+        full_pos = torch.cat(all_vit_pos + all_dino_pos + [text_act_pos], dim=-1)
+
+        # 🚨 最终断言：如果还是不等于 2403，说明拼接逻辑有根本性误解
+        assert full_pos.shape[-1] == (actual_prefix_len + suffix_len), \
+            f"Length Mismatch: PosIDs {full_pos.shape[-1]} != Embeds {actual_prefix_len + suffix_len}"
+            
+        return full_pos.to(device)
+        
+        # return torch.cat([full_vit_pos, full_dino_pos, text_act_pos], dim=-1).to(device)
+
+    # Add 20250110
+    # 把 prefix_pad_masks 扩展，并注入因果性
+    def build_pi0_attention_mask(self, prefix_pad_masks, suffix_len):
+        """
+        prefix_pad_masks: [B, prefix_L] (你 embed_prefix 返回的那个)
+        suffix_len: 动作长度
+        """
+        b, prefix_len = prefix_pad_masks.shape
+        total_len = prefix_len + suffix_len
+        device = prefix_pad_masks.device
+
+        # 1. 构造 2D 基础掩码 [B, total_L, total_L]
+        # 先初始化为全 True (可见)
+        mask_2d = torch.ones((b, total_len, total_len), dtype=torch.bool, device=device)
+
+        # 2. 处理 Padding (视觉/文本可能存在补齐)
+        # 让所有 Token 遵守 prefix 的 padding 规则
+        prefix_mask_expanded = prefix_pad_masks.unsqueeze(1).expand(-1, total_len, -1)
+        mask_2d[:, :, :prefix_len] &= prefix_mask_expanded
+
+        # 3. 注入因果律 (动作不能看未来)
+        # 仅对 Suffix 区域应用下三角掩码
+        causal_mask = torch.tril(torch.ones((suffix_len, suffix_len), device=device, dtype=torch.bool))
+        # 动作区（右下角）
+        mask_2d[:, prefix_len:, prefix_len:] &= causal_mask
+
+        # 4. 映射为数值掩码 (-inf)
+        return self._prepare_attention_masks_4d(mask_2d)

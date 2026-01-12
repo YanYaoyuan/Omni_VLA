@@ -1391,6 +1391,12 @@ class Qwen2VLForCausalLM(Qwen2VLPreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
+
+        在处理视觉信息时，单纯的 1D 展开会丢失空间拓扑关系。
+        对于文本：$T=H=W$，三个维度的索引完全相同（退化回 1D）。
+        对于视觉（图像/视频）：将视觉特征视为一个 3D 立方体。即使它们被拉平（flatten）成一维 Token 流，
+        通过 3D 索引，模型依然能知道哪些 Token 在空间上是相邻的。
+        
         Calculate the 3D rope index based on image and video's temporal, height and width in LLM.
 
         Explanation:

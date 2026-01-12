@@ -156,7 +156,7 @@ def get_rope_index_image_3D(
         mrope_position_deltas: Position delta tensor with shape (1, 1)
     """
     # Get spatial merge size from config
-    spatial_merge_size = 2 #self.config.vision_config.spatial_merge_size
+    spatial_merge_size = 1 #self.config.vision_config.spatial_merge_size
     
     # Extract image dimensions (temporal, height, width)
     t, h, w = image_grid_thw  # Unpack from shape (3,)
