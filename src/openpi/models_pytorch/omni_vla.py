@@ -200,11 +200,10 @@ class OmniVLA(nn.Module):
         self.gradient_checkpointing_enabled = False
         if self.use_g2vlm:
             # G2VLM uses different structure
-            # G2VLM uses different structure
-            self.g2vlm_with_expert.g2vlm.language_model.gradient_checkpointing = True
-            self.g2vlm_with_expert.g2vlm.vit_model.gradient_checkpointing = True
-        # Also enable for DINO model if it exists
-            self.g2vlm_with_expert.g2vlm.dino_model.gradient_checkpointing = True
+            self.g2vlm_with_expert.g2vlm.language_model.gradient_checkpointing = False
+            self.g2vlm_with_expert.g2vlm.vit_model.gradient_checkpointing = False
+            # Also disable for DINO model if it exists
+            self.g2vlm_with_expert.g2vlm.dino_model.gradient_checkpointing = False
         else:
             # PaliGemma structure
             logging.info("PaliGemma structure")
@@ -294,8 +293,11 @@ class OmniVLA(nn.Module):
             def image_embed_func(img):
                 return self.g2vlm_with_expert.embed_image(img)
 
-            # img_emb = self._apply_checkpoint(image_embed_func, img)
-            #mg_emb = image_embed_func(img)
+            img_emb_dict = self._apply_checkpoint(image_embed_func, img)
+            # 旧方法需要合并 semantic 和 geometric tokens
+            semantic_tokens = img_emb_dict["semantic"]
+            geometric_tokens = img_emb_dict["geometric"]
+            img_emb = torch.cat([semantic_tokens, geometric_tokens], dim=1)
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)
@@ -345,9 +347,15 @@ class OmniVLA(nn.Module):
             semantic_tokens = img_emb_dict["semantic"]
             geometric_tokens = img_emb_dict["geometric"]
 
-            # Add 20250110: 
+            # Add 20250110: 存储 grid 信息到 omni_vla 和 g2vlm_with_expert
             self.current_vit_grid.append(img_emb_dict["vit_grid"]) 
             self.current_dino_grid.append(img_emb_dict["dino_grid"])
+            # 同时存储到 g2vlm_with_expert，以便在 forward 中使用
+            if not hasattr(self.g2vlm_with_expert, 'current_vit_grid'):
+                self.g2vlm_with_expert.current_vit_grid = []
+                self.g2vlm_with_expert.current_dino_grid = []
+            self.g2vlm_with_expert.current_vit_grid.append(img_emb_dict["vit_grid"])
+            self.g2vlm_with_expert.current_dino_grid.append(img_emb_dict["dino_grid"])
 
             # --- 🚀 诊断点 1：视觉分支 ---
             print(f"DEBUG [Layer: Input]: semantic_tokens max: {semantic_tokens.abs().max().item():.4f}")
@@ -499,7 +507,8 @@ class OmniVLA(nn.Module):
             'dino_len': sum([torch.prod(g).item() for g in self.current_dino_grid]),
             'text_len': lang_tokens.shape[1],
             'vit_grid': self.current_vit_grid,
-            'dino_grid': self.current_dino_grid
+            'dino_grid': self.current_dino_grid,
+            'actual_prefix_len': prefix_embs.shape[1]  # 添加实际的 prefix 长度
         }
 
         print(f"DEBUG: prefix_embs shape: {prefix_embs.shape}")
@@ -558,7 +567,7 @@ class OmniVLA(nn.Module):
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks, prefix_token_type_ids = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
@@ -566,7 +575,7 @@ class OmniVLA(nn.Module):
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         # Set attention implementation (only for PaliGemma)
         if not self.use_g2vlm:
-            self.g2vlm_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+            self.g2vlm_with_expert.action_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
         _, past_key_values = self.g2vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
@@ -624,7 +633,7 @@ class OmniVLA(nn.Module):
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         # Set attention implementation (only for PaliGemma)
         if not self.use_g2vlm:
-            self.g2vlm_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+            self.g2vlm_with_expert.action_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
         outputs_embeds, _ = self.g2vlm_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
@@ -689,7 +698,8 @@ class OmniVLA(nn.Module):
         # 💡 这里要动态计算文本的真实长度，防止 text_len 不准
         # 总 prefix 长度 - 已分配的视觉长度 = 文本长度
         current_vision_len = sum([p.shape[-1] for p in all_vit_pos]) + sum([p.shape[-1] for p in all_dino_pos])
-        actual_prefix_len = 2352 # 建议从外部传入 prefix_embs.shape[1]
+        # 从 prefix_info 中获取实际的 prefix 长度，如果没有则从 text_len 和视觉长度计算
+        actual_prefix_len = prefix_info.get('actual_prefix_len', current_vision_len + prefix_info.get('text_len', 0))
         text_len = actual_prefix_len - current_vision_len
         
         # 4. 拼接文本和动作 (Suffix)

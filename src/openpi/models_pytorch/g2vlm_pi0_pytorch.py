@@ -289,6 +289,10 @@ class G2VLMWithActorExpertModel(nn.Module):
         self.action_expert.model.embed_tokens = None  # We'll use shared embeddings
 
         self.action_gate = nn.Parameter(torch.ones(28))
+        
+        # 存储当前 batch 的 grid 信息，用于构建 position_ids
+        self.current_vit_grid = []
+        self.current_dino_grid = []
 
         # action_expert_config_hf = Qwen2Config(
         #     hidden_size=llm_config.hidden_size,
@@ -439,7 +443,11 @@ class G2VLMWithActorExpertModel(nn.Module):
         if torch.isnan(geometric_tokens).any():
             print("❌ NaN detected after dinoProjector!")
 
-        # ---------- 3. 返回 ----------
+        # ---------- 3. 存储 grid 信息（用于构建 position_ids）----------
+        # 注意：这里只存储单张图的 grid，如果是 batch，需要在调用处累积
+        # 在 omni_vla.py 的 embed_prefix 中会累积这些信息
+        
+        # ---------- 4. 返回 ----------
         return {
             "semantic": vit_feats,      # [B, N_vit, D]
             "geometric": geometric_tokens,  # [B, N_dino, D]
@@ -551,7 +559,7 @@ class G2VLMWithActorExpertModel(nn.Module):
         # Case 2: only suffix (decode action)
         # --------------------------------------------------
         elif inputs_embeds[0] is None:
-            suffix_output = self.gemma_expert.model.forward(
+            suffix_output = self.action_expert.model.forward(
                 inputs_embeds=inputs_embeds[1],
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -579,6 +587,12 @@ class G2VLMWithActorExpertModel(nn.Module):
             for i, x in enumerate(inputs_embeds):
                 if x is not None:
                     print(f"Expert {i} input max: {x.abs().max()}")
+            
+            # 确保 grid 列表已初始化（在 embed_prefix 中会被填充）
+            if not hasattr(self, 'current_vit_grid'):
+                self.current_vit_grid = []
+            if not hasattr(self, 'current_dino_grid'):
+                self.current_dino_grid = []
 
 
 
@@ -589,24 +603,66 @@ class G2VLMWithActorExpertModel(nn.Module):
             suffix_len = inputs_embeds[1].shape[1]
             total_len = prefix_len + suffix_len
 
-            # 如果这里必须生成，且没有真实 ID，临时补救方案：
+            # 如果 position_ids 为 None，使用存储的 grid 信息构建
             if position_ids is None:
-                # 构造一个符合 get_rope_index 接口的输入
-                # 注意：image_grid_thw 对 Qwen2-VL 至关重要，否则视觉 3D 索引是错的
-                # 这里假设你已经把 image_grid_thw 存到了 self 中
+                # 使用和 omni_vla.py 中相同的方法构建 3D position_ids
+                from ..data_vlm.data_utils import get_rope_index_image_3D
+                
                 device = inputs_embeds[0].device
+                b = batch_size
+                curr_pos_val = 0
                 
-                # 构造 dummy input_ids (LongTensor!)
-                tmp_input_ids = torch.zeros((batch_size, total_len), dtype=torch.long, device=device)
+                # 1. 构建 ViT (语义) 位置编码
+                all_vit_pos = []
+                if hasattr(self, 'current_vit_grid') and len(self.current_vit_grid) > 0:
+                    for grid in self.current_vit_grid:
+                        pos_3d, delta = get_rope_index_image_3D(
+                            grid.flatten()[:3] if grid.dim() > 0 else grid[:3], 
+                            curr_position_id=curr_pos_val
+                        )
+                        all_vit_pos.append(pos_3d.unsqueeze(1).repeat(1, b, 1))
+                        curr_pos_val += int(delta) + 1
                 
-                # 调用 G2VLM 的获取索引方法
-                # 注意：这里会返回 [3, batch, total_len]
-                position_ids, _ = self.g2vlm.get_rope_index(
-                    input_ids=tmp_input_ids,
-                    image_grid_thw=getattr(self, 'current_image_grid_thw', None), 
-                    video_grid_thw=None,
-                    attention_mask=attention_mask
-                )
+                # 2. 构建 DINO (几何) 位置编码
+                all_dino_pos = []
+                if hasattr(self, 'current_dino_grid') and len(self.current_dino_grid) > 0:
+                    for grid in self.current_dino_grid:
+                        pos_3d, delta = get_rope_index_image_3D(
+                            grid.flatten()[:3] if grid.dim() > 0 else grid[:3], 
+                            curr_position_id=curr_pos_val
+                        )
+                        all_dino_pos.append(pos_3d.unsqueeze(1).repeat(1, b, 1))
+                        curr_pos_val += int(delta) + 1
+                
+                # 3. 计算文本和动作的长度
+                current_vision_len = sum([p.shape[-1] for p in all_vit_pos]) + sum([p.shape[-1] for p in all_dino_pos])
+                actual_prefix_len = prefix_len
+                text_len = actual_prefix_len - current_vision_len
+                
+                # 4. 构建文本和动作的位置编码（线性 T 轴）
+                total_incremental_len = text_len + suffix_len
+                incremental_ids = torch.arange(curr_pos_val, curr_pos_val + total_incremental_len, device=device)
+                text_act_pos = incremental_ids.unsqueeze(0).unsqueeze(0).repeat(3, b, 1)
+                
+                # 5. 拼接所有位置编码
+                all_pos = all_vit_pos + all_dino_pos
+                if all_pos:
+                    full_pos = torch.cat(all_pos + [text_act_pos], dim=-1)
+                else:
+                    # 如果没有视觉信息，只使用文本和动作
+                    full_pos = text_act_pos
+                
+                position_ids = full_pos.to(device)
+                
+                # 验证长度
+                expected_len = actual_prefix_len + suffix_len
+                if position_ids.shape[-1] != expected_len:
+                    logging.warning(
+                        f"Position IDs length mismatch: got {position_ids.shape[-1]}, expected {expected_len}. "
+                        f"Using fallback linear position encoding."
+                    )
+                    # 后备方案：使用简单的线性位置编码
+                    position_ids = torch.arange(expected_len, device=device).unsqueeze(0).unsqueeze(0).repeat(3, b, 1)
 
             # 确保 position_ids 是 3 维的: [3, B, L]
             if position_ids.dim() == 2:
