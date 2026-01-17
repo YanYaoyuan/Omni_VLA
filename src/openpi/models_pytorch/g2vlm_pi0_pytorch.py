@@ -364,7 +364,8 @@ class G2VLMWithActorExpertModel(nn.Module):
         """
 
         # --- 🚀 核心诊断：检查输入像素 ---
-        print("-" * 30)
+        logging.info("Check the Image Input Infor")
+        
         print(f"DEBUG [Image Raw]: dtype: {image.dtype}")
         print(f"DEBUG [Image Raw]: shape: {image.shape}")
         print(f"DEBUG [Image Raw]: min: {image.min().item():.4f}")

@@ -2,6 +2,8 @@ import logging
 import math
 from typing import Optional
 
+import matplotlib.pyplot as plt
+
 import torch
 from torch import Tensor
 from torch import nn
@@ -743,6 +745,22 @@ class OmniVLA(nn.Module):
         causal_mask = torch.tril(torch.ones((suffix_len, suffix_len), device=device, dtype=torch.bool))
         # 动作区（右下角）
         mask_2d[:, prefix_len:, prefix_len:] &= causal_mask
+
+        # 4. ❗VLA 关键：prefix 不能看 action
+        mask_2d[:, :prefix_len, prefix_len:] = False
+
+        # mask = mask_2d[0].int()   # 取第一个 batch，True/False → 1/0
+        # print(mask)
+
+        # plt.figure(figsize=(6, 6))
+        # plt.imshow(mask_2d[0].cpu(), cmap="gray")
+        # plt.axvline(prefix_len - 0.5, color="red")
+        # plt.axhline(prefix_len - 0.5, color="red")
+        # plt.title("VLA Attention Mask")
+
+        # plt.savefig("vla_attention_mask.png", dpi=200, bbox_inches="tight")
+        # plt.close()   # 很重要，防止显存/句柄泄露
+
 
         # 4. 映射为数值掩码 (-inf)
         return self._prepare_attention_masks_4d(mask_2d)
