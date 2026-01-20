@@ -133,7 +133,7 @@ We will fine-tune the $\pi_{0.5}$ model on the [LIBERO dataset](https://libero-p
 We provide a minimal example script for converting LIBERO data to a LeRobot dataset in [`examples/libero/convert_libero_data_to_lerobot.py`](examples/libero/convert_libero_data_to_lerobot.py). You can easily modify it to convert your own data! You can download the raw LIBERO dataset from [here](https://huggingface.co/datasets/openvla/modified_libero_rlds), and run the script with:
 
 ```bash
-uv run examples/libero/convert_libero_data_to_lerobot.py --data_dir /path/to/your/libero/data
+uv run --no-sync examples/libero/convert_libero_data_to_lerobot.py --data_dir /path/to/your/libero/data
 ```
 
 **Note:** If you just want to fine-tune on LIBERO, you can skip this step, because our LIBERO fine-tuning configs point to a pre-converted LIBERO dataset. This step is merely an example that you can adapt to your own data.
@@ -151,13 +151,13 @@ We provide example fine-tuning configs for [π₀](src/openpi/training/config.py
 Before we can run training, we need to compute the normalization statistics for the training data. Run the script below with the name of your training config:
 
 ```bash
-uv run scripts/compute_norm_stats.py --config-name pi05_libero
+uv run --no-sync scripts/compute_norm_stats.py --config-name pi05_libero
 ```
 
 Now we can kick off training with the following command (the `--overwrite` flag is used to overwrite existing checkpoints if you rerun fine-tuning with the same config):
 
 ```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_libero --exp-name=my_experiment --overwrite
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run --no-sync scripts/train.py pi05_libero --exp-name=my_experiment --overwrite
 ```
 
 The command will log training progress to the console and save checkpoints to the `checkpoints` directory. You can also monitor training progress on the Weights & Biases dashboard. For maximally using the GPU memory, set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` before running training -- this enables JAX to use up to 90% of the GPU memory (vs. the default of 75%).
@@ -169,7 +169,7 @@ The command will log training progress to the console and save checkpoints to th
 Once training is complete, we can run inference by spinning up a policy server and then querying it from a LIBERO evaluation script. Launching a model server is easy (we use the checkpoint for iteration 20,000 for this example, modify as needed):
 
 ```bash
-uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_libero --policy.dir=checkpoints/pi05_libero/my_experiment/20000
+uv run --no-sync scripts/serve_policy.py policy:checkpoint --policy.config=pi05_libero --policy.dir=checkpoints/pi05_libero/my_experiment/20000
 ```
 
 This will spin up a server that listens on port 8000 and waits for observations to be sent to it. We can then run an evaluation script (or robot runtime) that queries the server.
@@ -216,7 +216,7 @@ This overwrites several files in the transformers library with necessary model c
 To convert a JAX model checkpoint to PyTorch format:
 
 ```bash
-uv run examples/convert_jax_model_to_pytorch.py \
+uv run --no-sync examples/convert_jax_model_to_pytorch.py \
     --checkpoint_dir /path/to/jax/checkpoint \
     --config_name <config name> \
     --output_path /path/to/converted/pytorch/checkpoint
@@ -246,7 +246,7 @@ action_chunk = policy.infer(example)["actions"]
 The policy server works identically with PyTorch models - just point to the converted checkpoint directory:
 
 ```bash
-uv run scripts/serve_policy.py policy:checkpoint \
+uv run --no-sync scripts/serve_policy.py policy:checkpoint \
     --policy.config=pi05_droid \
     --policy.dir=/path/to/converted/pytorch/checkpoint
 ```
@@ -257,7 +257,7 @@ To finetune a model in PyTorch:
 
 1. Convert the JAX base model to PyTorch format:
    ```bash
-   uv run examples/convert_jax_model_to_pytorch.py \
+   uv run --no-sync examples/convert_jax_model_to_pytorch.py \
        --config_name <config name> \
        --checkpoint_dir /path/to/jax/base/model \
        --output_path /path/to/pytorch/base/model
@@ -269,21 +269,21 @@ To finetune a model in PyTorch:
 
 ```bash
 # Single GPU training:
-uv run scripts/train_pytorch.py <config_name> --exp_name <run_name> --save_interval <interval>
+uv run --no-sync scripts/train_pytorch.py <config_name> --exp_name <run_name> --save_interval <interval>
 
 # Example:
-uv run scripts/train_pytorch.py debug --exp_name pytorch_test
-uv run scripts/train_pytorch.py debug --exp_name pytorch_test --resume  # Resume from latest checkpoint
+uv run --no-sync scripts/train_pytorch.py debug --exp_name pytorch_test
+uv run --no-sync scripts/train_pytorch.py debug --exp_name pytorch_test --resume  # Resume from latest checkpoint
 
 # Multi-GPU training (single node):
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=<num_gpus> scripts/train_pytorch.py <config_name> --exp_name <run_name>
+uv run --no-sync torchrun --standalone --nnodes=1 --nproc_per_node=<num_gpus> scripts/train_pytorch.py <config_name> --exp_name <run_name>
 
 # Example:
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test --resume
+uv run --no-sync torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test
+uv run --no-sync torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test --resume
 
 # Multi-Node Training:
-uv run torchrun \
+uv run --no-sync torchrun \
     --nnodes=<num_nodes> \
     --nproc_per_node=<gpus_per_node> \
     --node_rank=<rank_of_node> \

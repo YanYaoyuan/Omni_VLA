@@ -73,10 +73,10 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
         config="pi05_libero",
         dir="gs://openpi-assets/checkpoints/pi05_libero",
     ),
-    # EnvMode.LIBERO: Checkpoint(
-    #     config="omni_vla_libero",
-    #     dir="//omni_vla_libero",
-    # ),
+    EnvMode.LIBERO: Checkpoint(
+        config="omni_vla_libero",
+        dir="/data/openpi_temp/checkpoints/pi0_libero_low_mem_finetune/omni_9/30000",
+    ),
 }
 
 

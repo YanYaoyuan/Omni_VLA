@@ -40,7 +40,7 @@ roslaunch aloha ros_nodes.launch
 Terminal window 3:
 
 ```bash
-uv run scripts/serve_policy.py --env ALOHA --default_prompt='take the toast out of the toaster'
+uv run --no-sync scripts/serve_policy.py --env ALOHA --default_prompt='take the toast out of the toaster'
 ```
 
 ## **ALOHA Checkpoint Guide**

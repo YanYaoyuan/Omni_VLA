@@ -32,5 +32,5 @@ Terminal window 2:
 
 ```bash
 # Run the server
-uv run scripts/serve_policy.py --env ALOHA_SIM
+uv run --no-sync scripts/serve_policy.py --env ALOHA_SIM
 ```
