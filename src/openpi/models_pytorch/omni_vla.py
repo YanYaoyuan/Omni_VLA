@@ -94,7 +94,7 @@ def make_att_2d_masks(pad_masks, att_masks):
 
 
 class OmniVLA(nn.Module):
-    def __init__(self, config: Pi0Config, g2vlm_model=None):
+    def __init__(self, config: Pi0Config, device: torch.device,  g2vlm_model=None):
         """
         Initialize from PI0Pytorch model config.
         
@@ -124,7 +124,8 @@ class OmniVLA(nn.Module):
             # Use G2VLM adapter
             self.g2vlm_with_expert = G2VLMWithActorExpertModel(
                 g2_vlm_path=g2_path,
-                action_expert_config=action_expert_config
+                action_expert_config=action_expert_config,
+                device=device,
             )
             logging.info("Using G2VLM adapter for PI-0 VLA")
         else:

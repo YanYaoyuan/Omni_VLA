@@ -66,47 +66,7 @@ from openpi.vlm_expert.qwen2vl.modeling_qwen2_vl import Qwen2VisionTransformerPr
 from openpi.vlm_expert.g2vlm.qwen2vl import Qwen2VLForCausalLM
 from openpi.vlm_expert.qwen2vl.configuration_qwen2_vl import Qwen2VLVisionConfig
 
-def load_model_and_tokenizer(model_path):
-    llm_config = Qwen2VLConfig.from_json_file(os.path.join(model_path, "text_config.json"))
 
-    llm_config.qk_norm = True
-    llm_config.tie_word_embeddings = False
-    llm_config.layer_module = 'Qwen2VLMoTDecoderLayer'  
-
-    vit_config = Qwen2VLVisionConfig.from_json_file(os.path.join(model_path, "vit_config.json"))
-    vit_config.patch_size =14
-
-    dino_config = Dinov2WithRegistersConfig.from_json_file(os.path.join(model_path, "dino_config.json"))
-
-    config = G2VLMConfig(
-        visual_und=True,
-        visual_recon=True, # Dino use
-        llm_config=llm_config, 
-        vit_config=vit_config,
-        dino_config=dino_config,
-        vit_max_num_patch_per_side=36,
-    )
-    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
-    language_model = Qwen2VLForCausalLM(llm_config).to(device)
-    vit_model      = Qwen2VisionTransformerPretrainedModel(vit_config).to(device)
-    dino_model = Dinov2WithRegistersModel(dino_config).to(device)
-
-    model = G2VLM(language_model, vit_model, dino_model, config)
-
-    tokenizer = Qwen2Tokenizer.from_pretrained(model_path)
-    tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
-
-    vit_image_transform = QwenVL2ImageTransform(768, 768, 14)
-    dino_transform = DinoImageNormalizeTransform(target_size=518)
-
-    model_state_dict_path = os.path.join(model_path, "model.safetensors")
-    model_state_dict = load_file(model_state_dict_path, device="cpu")
-    msg = model.load_state_dict(model_state_dict, strict=False)
-    print(msg)
-    del model_state_dict
-    model = model.cuda().eval()
-
-    return model, tokenizer, new_token_ids , vit_image_transform, dino_transform
 
 
 # Load G2VLM config from checkpoint directory
@@ -656,6 +616,9 @@ def train_loop(config: _config.TrainConfig):
     #     object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
     # model = openpi.models_pytorch.omni(OmniConfig=model_cfg).to(device)
+
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
     model_cfg = config.model
 
     # Load G2VLM config from checkpoint if provided, otherwise use default
@@ -673,7 +636,7 @@ def train_loop(config: _config.TrainConfig):
     # g2_model, tokenizer, new_token_ids , vit_image_transform, dino_transform = load_model_and_tokenizer(config.pytorch_weight_path)
     g2_model_path = config.pytorch_weight_path
     g2_model_path = '/home/user/robot/model/G2VLM-2B-MoT'
-    model = OmniVLA(config=model_cfg, g2vlm_model=g2_model_path)
+    model = OmniVLA(config=model_cfg, device=device, g2vlm_model=g2_model_path)
 
     enable_gradient_checkpointing = False
     model.gradient_checkpointing_disable()
@@ -700,6 +663,9 @@ def train_loop(config: _config.TrainConfig):
         logging.info("Enabled memory optimizations for 8+ GPU training")
 
     if use_ddp:
+
+        model = model.to(device)
+
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
@@ -712,10 +678,15 @@ def train_loop(config: _config.TrainConfig):
     # if g2vlm_weight_path is provided in the config
 
     # Optimizer + learning rate schedule from config
-    warmup_steps = config.lr_schedule.warmup_steps
-    peak_lr = config.lr_schedule.peak_lr
-    decay_steps = config.lr_schedule.decay_steps
-    end_lr = config.lr_schedule.decay_lr
+    omni_warmup_steps = 1_000
+    omni_peak_lr = 5e-5
+    omni_decay_steps = 1_000_000
+    omni_decay_lr = 5e-5
+
+    warmup_steps = omni_warmup_steps
+    peak_lr = omni_peak_lr
+    decay_steps = omni_decay_steps
+    end_lr = omni_decay_lr
 
     # Create optimizer with config parameters
     optim = torch.optim.AdamW(
@@ -725,6 +696,7 @@ def train_loop(config: _config.TrainConfig):
         eps=config.optimizer.eps,
         weight_decay=config.optimizer.weight_decay,
     )
+
 
     # Load checkpoint if resuming
     global_step = 0

@@ -188,32 +188,52 @@ def build_transform(pixel=224):
 
     return image_transform
 
-def load_model_and_tokenizer(model_path):
+def load_model_and_tokenizer(model_path, device):
     llm_config = Qwen2VLConfig.from_json_file(os.path.join(model_path, "text_config.json"))
-
     llm_config.qk_norm = True
     llm_config.tie_word_embeddings = False
-    llm_config.layer_module = 'Qwen2VLMoTDecoderLayer'  
+    llm_config.layer_module = 'Qwen2VLMoTDecoderLayer'
 
     vit_config = Qwen2VLVisionConfig.from_json_file(os.path.join(model_path, "vit_config.json"))
-    vit_config.patch_size =14
+    vit_config.patch_size = 14
 
     dino_config = Dinov2WithRegistersConfig.from_json_file(os.path.join(model_path, "dino_config.json"))
 
     config = G2VLMConfig(
         visual_und=True,
-        visual_recon=True, # Dino use
-        llm_config=llm_config, 
+        visual_recon=True,
+        llm_config=llm_config,
         vit_config=vit_config,
         dino_config=dino_config,
         vit_max_num_patch_per_side=36,
     )
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    language_model = Qwen2VLForCausalLM(llm_config).to(device)
-    vit_model      = Qwen2VisionTransformerPretrainedModel(vit_config).to(device)
-    dino_model = Dinov2WithRegistersModel(dino_config).to(device)
+
+    # 🚨 1. 全部先在 CPU + fp16
+    language_model = Qwen2VLForCausalLM(
+        llm_config,
+        #torch_dtype=torch.float16,
+    )
+
+    vit_model = Qwen2VisionTransformerPretrainedModel(
+        vit_config,
+        #torch_dtype=torch.float16,
+    )
+
+    dino_model = Dinov2WithRegistersModel(
+        dino_config,
+    )
 
     model = G2VLM(language_model, vit_model, dino_model, config)
+
+    # 🚨 2. load 权重（CPU）
+    model_state_dict_path = os.path.join(model_path, "model.safetensors")
+    state_dict = load_file(model_state_dict_path, device="cpu")
+    msg = model.load_state_dict(state_dict, strict=False)
+    print(msg)
+    del state_dict
+
+    # 🚨 3. 只在这里搬一次
+    model = model.to(device).eval()
 
     tokenizer = Qwen2Tokenizer.from_pretrained(model_path)
     tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
@@ -221,14 +241,8 @@ def load_model_and_tokenizer(model_path):
     vit_image_transform = QwenVL2ImageTransform(768, 768, 14)
     dino_transform = DinoImageNormalizeTransform(target_size=518)
 
-    model_state_dict_path = os.path.join(model_path, "model.safetensors")
-    model_state_dict = load_file(model_state_dict_path, device="cpu")
-    msg = model.load_state_dict(model_state_dict, strict=False)
-    print(msg)
-    del model_state_dict
-    model = model.cuda().eval()
+    return model, tokenizer, new_token_ids, vit_image_transform, dino_transform, llm_config
 
-    return model, tokenizer, new_token_ids , vit_image_transform, dino_transform, llm_config
 
 # ---------- 1. 三专家 MoT ----------
 class G2VLMWithActorExpertModel(nn.Module):
@@ -246,6 +260,7 @@ class G2VLMWithActorExpertModel(nn.Module):
         self,
         g2_vlm_path,
         action_expert_config,
+        device: torch.device,
         use_adarms=None,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
         image_size: int = 224,
@@ -255,7 +270,7 @@ class G2VLMWithActorExpertModel(nn.Module):
         super().__init__()
 
         # If G2VLM model is provided, use it directly
-        g2_model, tokenizer, new_token_ids , vit_image_transform, dino_transform, llm_config= load_model_and_tokenizer(g2_vlm_path)
+        g2_model, tokenizer, new_token_ids , vit_image_transform, dino_transform, llm_config= load_model_and_tokenizer(g2_vlm_path, device)
         device = g2_model.device
         self.g2vlm = g2_model.to(device = device)
         self.vit_image_transform = build_transform()# set 224

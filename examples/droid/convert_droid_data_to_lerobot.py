@@ -474,4 +474,6 @@ def load_trajectory(
 
 
 if __name__ == "__main__":
-    tyro.cli(main)
+    data_dir: str = "/mnt/yan_data/dataset/droid_lerobot"  # Replace with your DROID data path
+    # tyro.cli(main)
+    main(data_dir, push_to_hub=False)
