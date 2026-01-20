@@ -15,6 +15,7 @@ from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 from openpi.vlm_expert.g2vlm.g2vlm import G2VLMConfig
 from openpi.models.pi0_config import Pi0Config
+from openpi.models_pytorch.omni_config import OmniConfig
 
 from ..data_vlm.data_utils import get_rope_index_image_3D
 from ..data_vlm.data_utils import get_rope_index_image_3D_dino
@@ -94,7 +95,7 @@ def make_att_2d_masks(pad_masks, att_masks):
 
 
 class OmniVLA(nn.Module):
-    def __init__(self, config: Pi0Config, device: torch.device,  g2vlm_model=None):
+    def __init__(self, config: OmniConfig, device: torch.device):
         """
         Initialize from PI0Pytorch model config.
         
@@ -104,10 +105,11 @@ class OmniVLA(nn.Module):
         """
         super().__init__()
         self.config = config
-        self.use_g2vlm = g2vlm_model is not None
+        self.use_pre_g2vlm = config.use_pretrained_g2vlm
 
         action_expert_config = _gemma.get_config(config.action_expert_variant)
-        g2_path = g2vlm_model
+        g2_path = config.pretrained_g2vlm_path
+        g2_config_path = config.g2vlm_config_path
 
         
 
@@ -117,13 +119,15 @@ class OmniVLA(nn.Module):
             G2VLM_AVAILABLE = True
         except ImportError:
             G2VLM_AVAILABLE = False
-            if g2vlm_model is not None:
-                raise ImportError("G2VLM adapter not available but g2vlm_model was provided")
+            #if g2vlm_model is not None:
+            raise ImportError("G2VLM Model Path pretrained need modifyed")
 
-        if self.use_g2vlm and G2VLM_AVAILABLE:
+        if G2VLM_AVAILABLE:
             # Use G2VLM adapter
+            logging.info("Initializing OmniVLA with G2VLM...")
             self.g2vlm_with_expert = G2VLMWithActorExpertModel(
-                g2_vlm_path=g2_path,
+                g2_vlm_path=g2_config_path,
+                pretrained_g2vlm=self.use_pre_g2vlm,
                 action_expert_config=action_expert_config,
                 device=device,
             )
@@ -187,7 +191,7 @@ class OmniVLA(nn.Module):
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
-        if self.use_g2vlm:
+        if self.use_pre_g2vlm:
             # G2VLM uses different structure
             self.g2vlm_with_expert.g2vlm.language_model.gradient_checkpointing = True
             self.g2vlm_with_expert.g2vlm.vit_model.gradient_checkpointing = True
@@ -201,7 +205,7 @@ class OmniVLA(nn.Module):
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing."""
         self.gradient_checkpointing_enabled = False
-        if self.use_g2vlm:
+        if self.use_pre_g2vlm:
             # G2VLM uses different structure
             self.g2vlm_with_expert.g2vlm.language_model.gradient_checkpointing = False
             self.g2vlm_with_expert.g2vlm.vit_model.gradient_checkpointing = False

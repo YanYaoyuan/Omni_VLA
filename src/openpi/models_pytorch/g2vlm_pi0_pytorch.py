@@ -188,7 +188,13 @@ def build_transform(pixel=224):
 
     return image_transform
 
-def load_model_and_tokenizer(model_path, device):
+def load_model_and_tokenizer(model_path, use_pretrained_g2vlm, device):
+
+    # if use_pretrained_g2vlm:
+    #     model_path = model_path 
+    # else:
+    #     model_path = '/data/openpi_temp/checkpoints/pi0_libero_low_mem_finetune/omni_9/30000'
+
     llm_config = Qwen2VLConfig.from_json_file(os.path.join(model_path, "text_config.json"))
     llm_config.qk_norm = True
     llm_config.tie_word_embeddings = False
@@ -226,11 +232,13 @@ def load_model_and_tokenizer(model_path, device):
     model = G2VLM(language_model, vit_model, dino_model, config)
 
     # 🚨 2. load 权重（CPU）
-    model_state_dict_path = os.path.join(model_path, "model.safetensors")
-    state_dict = load_file(model_state_dict_path, device="cpu")
-    msg = model.load_state_dict(state_dict, strict=False)
-    print(msg)
-    del state_dict
+    if use_pretrained_g2vlm:
+        logging.info(f"Loading pretrained G2VLM from {model_path}")
+        model_state_dict_path = os.path.join(model_path, "model.safetensors")
+        state_dict = load_file(model_state_dict_path, device="cpu")
+        msg = model.load_state_dict(state_dict, strict=False)
+        print(msg)
+        del state_dict
 
     # 🚨 3. 只在这里搬一次
     model = model.to(device).eval()
@@ -260,6 +268,7 @@ class G2VLMWithActorExpertModel(nn.Module):
         self,
         g2_vlm_path,
         action_expert_config,
+        pretrained_g2vlm,
         device: torch.device,
         use_adarms=None,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
@@ -270,7 +279,9 @@ class G2VLMWithActorExpertModel(nn.Module):
         super().__init__()
 
         # If G2VLM model is provided, use it directly
-        g2_model, tokenizer, new_token_ids , vit_image_transform, dino_transform, llm_config= load_model_and_tokenizer(g2_vlm_path, device)
+        logging.info(f"use pretrained G2vlm? {pretrained_g2vlm}")
+
+        g2_model, tokenizer, new_token_ids , vit_image_transform, dino_transform, llm_config= load_model_and_tokenizer(g2_vlm_path, pretrained_g2vlm, device)
         device = g2_model.device
         self.g2vlm = g2_model.to(device = device)
         self.vit_image_transform = build_transform()# set 224

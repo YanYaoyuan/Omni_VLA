@@ -17,7 +17,7 @@ import orbax.checkpoint as ocp
 import safetensors
 import torch
 
-from openpi.models_pytorch import pi0_pytorch
+
 from openpi.shared import image_tools
 import openpi.shared.array_typing as at
 
@@ -241,8 +241,11 @@ class BaseModelConfig(abc.ABC):
         return nnx.merge(graphdef, state)
 
     def load_pytorch(self, train_config, weight_path: str):
+        logger.info(f"Load PyTorch OmniVLA model from {weight_path}")
         logger.info(f"train_config: {train_config}")
-        model = pi0_pytorch.PI0Pytorch(config=train_config.model)
+        from openpi.models_pytorch import omni_vla 
+        # model = pi0_pytorch.PI0Pytorch(config=train_config.model)
+        model = omni_vla.OmniVLA(config=train_config.model, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         safetensors.torch.load_model(model, weight_path)
         return model
 

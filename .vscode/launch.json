@@ -22,6 +22,27 @@
     "console": "integratedTerminal",
     "justMyCode": false,
     "subProcess": true
+  },
+    {
+    "name": "Python: OmniVLA_Evalu",
+    "type": "python",
+    "request": "launch",
+    "python": "/home/user/robot/openpi/.venv/bin/python",
+    "program": "${workspaceFolder}/scripts/serve_policy.py",
+    "args": [
+        "--env",
+        "LIBERO"
+    ],
+    "env": {
+      "PYTHONPATH": "${workspaceFolder}",
+      "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.9",
+      "CUDA_VISIBLE_DEVICES": "1",
+      "TF_CPP_MIN_LOG_LEVEL": "0",
+      "TF_ENABLE_ONEDNN_OPTS": "0"
+    },
+    "console": "integratedTerminal",
+    "justMyCode": false,
+    "subProcess": true
   }
-  ]
+  ],
 }

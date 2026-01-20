@@ -1,27 +1,43 @@
 import dataclasses
-from typing import Optional, Literal, override
-import torch
+from typing import Optional
+from typing_extensions import override
+
 import openpi.models.pi0_config as _pi0_config
-from openpi.models import gemma as _gemma
+from openpi.models import model as _model
+
 
 @dataclasses.dataclass(frozen=True)
 class OmniConfig(_pi0_config.Pi0Config):
-    # --- 新增 G2VLM 相关配置 ---
-    g2vlm_path: str = ""  # G2VLM 模型权重路径
-    
-    # --- 覆盖或继承 PI0 的配置 ---
+    """
+    OmniVLA = G2VLM (frozen) + PI0 Action Expert
+    """
+
+    # ------------------------------------------------------------------
+    # G2VLM
+    # ------------------------------------------------------------------
+    g2vlm_path: str = ""  # checkpoint 或 HF repo
+
+    # ------------------------------------------------------------------
+    # 基础模型配置（覆盖 Pi0）
+    # ------------------------------------------------------------------
     dtype: str = "bfloat16"
-    action_expert_variant: str = "gemma_300m" # 对应你代码中的 Action Expert
-    
-    # 机器人控制参数
+    action_expert_variant: str = "gemma_300m"
+
+
+    use_pretrained_g2vlm: bool = False
+    pretrained_g2vlm_path : str = '/data/openpi_temp/checkpoints/pi0_libero_low_mem_finetune/omni_9/30000'  # checkpoint 或 HF repo
+    g2vlm_config_path : str = "/home/user/robot/model/G2VLM-2B-MoT"  # checkpoint 或 HF repo
+
     action_dim: int = 32
     action_horizon: int = 50
-    
-    # 模型模式
-    pi05: bool = False  # 如果是 True，会影响 token 长度和 AdaRMS 使用
-    
-    # --- 训练/冻结逻辑适配 ---
-    # 默认冻结 G2VLM 的所有视觉和语言组件，只训练 Action Expert 和投影层
+
+    # PI0 / PI05 行为
+    pi05: bool = False
+
+    # ------------------------------------------------------------------
+    # 训练 / 冻结策略
+    # ------------------------------------------------------------------
+    # 这些是「参数名路径前缀」，供 PyTorch 使用
     frozen_patterns: tuple[str, ...] = (
         "g2vlm.dino_model",
         "g2vlm.vit_model",
@@ -31,32 +47,62 @@ class OmniConfig(_pi0_config.Pi0Config):
         "g2vlm.global_points_decoder",
     )
 
-    # 这里的 freeze_filter 主要给 JAX 或 自动化脚本参考
-    use_lora: bool = False 
+    # JAX / 自动化脚本参考
+    use_lora: bool = False
 
+    # ------------------------------------------------------------------
+    # 自动推导 token 长度
+    # ------------------------------------------------------------------
     def __post_init__(self):
-        # 自动设置 token 长度
         if self.max_token_len is None:
-            # G2VLM 通常需要处理更多的视觉 token 或 3D token
-            object.__setattr__(self, "max_token_len", 256 if self.pi05 else 128)
-            
+            object.__setattr__(
+                self,
+                "max_token_len",
+                256 if self.pi05 else 128,
+            )
+
+    # ------------------------------------------------------------------
+    # Model type（⚠️ 不能复用 PI0 / PI05）
+    # ------------------------------------------------------------------
+    @property
+    @override
+    def model_type(self) -> _model.ModelType:
+        # 如果你愿意，后续可以在 ModelType 里正式加一个 OMNI
+        return "OMNI_VLA"  # PyTorch 路径不会用 enum
+
+    # ------------------------------------------------------------------
+    # PyTorch 实例化入口（核心）
+    # ------------------------------------------------------------------
+    def get_pytorch_model(
+        self,
+        g2vlm_instance_path: Optional[str] = None,
+    ):
+        """
+        用于 serve_policy / train_policy
+        """
+        from openpi.models_pytorch.omni_vla import OmniVLA
+
+        g2vlm_path = g2vlm_instance_path or self.g2vlm_path
+        if not g2vlm_path:
+            raise ValueError("OmniConfig requires g2vlm_path")
+
+        return OmniVLA(
+            config=self,
+            g2vlm_model_path=g2vlm_path,
+        )
+    
     @property
     def model_type(self):
-        return "OmniVLA"
+        return _model.ModelType.PI0  # 或 PI05
 
-    def get_pytorch_model(self, g2vlm_instance_path: Optional[str] = None):
-        """
-        辅助方法：直接通过此 config 实例化你的 OmniVLA 模型
-        """
-        from .omni_vla import OmniVLA # 替换为 OmniVLA 所在的实际路径
-        path = g2vlm_instance_path or self.g2vlm_path
-        return OmniVLA(config=self, g2vlm_model=path)
-
-    # 重写冻结逻辑以匹配你的代码需求
+    # ------------------------------------------------------------------
+    # 冻结规则（PyTorch 友好）
+    # ------------------------------------------------------------------
     @override
     def get_freeze_filter(self) -> list[str]:
         """
-        返回在配置文件中定义的冻结模式。
-        这个列表可以被 PyTorch 的训练脚本读取，用来设置 requires_grad。
+        返回需要被冻结的参数路径前缀。
+        PyTorch 脚本可直接：
+            if name.startswith(prefix): param.requires_grad = False
         """
         return list(self.frozen_patterns)
