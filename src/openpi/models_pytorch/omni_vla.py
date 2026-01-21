@@ -538,8 +538,9 @@ class OmniVLA(nn.Module):
         # att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
         # Apply gradient checkpointing if enabled
-        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
+        def forward_func(observation, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
             (_, suffix_out), _ = self.g2vlm_with_expert.forward(
+                observation = observation,
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
@@ -550,7 +551,7 @@ class OmniVLA(nn.Module):
             return suffix_out
 
         suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+            forward_func, observation, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
         suffix_out = suffix_out[:, -self.config.action_horizon :]
@@ -581,10 +582,11 @@ class OmniVLA(nn.Module):
         # Compute image and language key value cache
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         # Set attention implementation (only for PaliGemma)
-        if not self.use_g2vlm:
+        if not self.use_pre_g2vlm:
             self.g2vlm_with_expert.action_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
         _, past_key_values = self.g2vlm_with_expert.forward(
+            observation = observation,
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -639,7 +641,7 @@ class OmniVLA(nn.Module):
         # Prepare attention masks
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         # Set attention implementation (only for PaliGemma)
-        if not self.use_g2vlm:
+        if not self.use_pre_g2vlm:
             self.g2vlm_with_expert.action_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
         outputs_embeds, _ = self.g2vlm_with_expert.forward(

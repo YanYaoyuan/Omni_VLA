@@ -636,7 +636,7 @@ def train_loop(config: _config.TrainConfig):
     # g2_model, tokenizer, new_token_ids , vit_image_transform, dino_transform = load_model_and_tokenizer(config.pytorch_weight_path)
     g2_model_path = config.pytorch_weight_path
     g2_model_path = '/home/user/robot/model/G2VLM-2B-MoT'
-    model = OmniVLA(config=model_cfg, device=device, g2vlm_model=g2_model_path)
+    model = OmniVLA(config=model_cfg, device=device)
 
     enable_gradient_checkpointing = False
     model.gradient_checkpointing_disable()

@@ -551,6 +551,7 @@ class G2VLMWithActorExpertModel(nn.Module):
     
     def forward(
         self,
+        observation,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values=None,
@@ -570,8 +571,8 @@ class G2VLMWithActorExpertModel(nn.Module):
         # Case 1: only prefix (encode / prefill)
         # --------------------------------------------------
         if inputs_embeds[1] is None:
-            prefix_output = self.g2vlm.language_model.forward(
-                inputs_embeds=inputs_embeds[0],
+            prefix_output = self.g2vlm.language_model.base_model.forward(
+                input_ids=observation.tokenized_prompt,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
