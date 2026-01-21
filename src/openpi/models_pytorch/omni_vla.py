@@ -249,10 +249,8 @@ class OmniVLA(nn.Module):
         )
 
     def sample_time(self, bsize, device):
-        time_beta = sample_beta(
-            self.config.time_sampling_beta_alpha, self.config.time_sampling_beta_beta, bsize, device
-        )
-        time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
+        time_beta = sample_beta(1.5, 1.0, bsize, device)
+        time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
@@ -269,7 +267,7 @@ class OmniVLA(nn.Module):
         for img, img_mask in zip(images, img_masks, strict=True):
 
             def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
+                return self.reasoning_spatial_expert.reasoning_expert.get_image_features(img)
 
             img_emb = self._apply_checkpoint(image_embed_func, img)
 
@@ -283,7 +281,7 @@ class OmniVLA(nn.Module):
 
         # Process language tokens
         def lang_embed_func(lang_tokens):
-            lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
+            lang_emb = self.reasoning_spatial_expert.reasoning_expert.language_model.get_input_embeddings()(lang_tokens)
             lang_emb_dim = lang_emb.shape[-1]
             return lang_emb * math.sqrt(lang_emb_dim)
 
@@ -318,27 +316,28 @@ class OmniVLA(nn.Module):
         return features
 
     def embed_spatial(self, images, img_masks):
-        device = images[0].device
-        B, N_view, T = images.shape[:3]
-        features = self.get_cosmos_features(images)
-        
-        B, N_view, T = features.shape[:3]
-        features = rearrange(features, 'b n t c h w -> (b n t) c h w')
-        features = self.cosmos_in_proj(features)
-        features = self.downsample_conv(features) 
-        features = rearrange(features, '(b n t) c h w -> b n t c h w', b=B, n=N_view, t=T)
-        self.cosmos_feat_shape = features.shape
+        """Embed spatial images to prepare for Expert Gemma processing."""
+        embs = []
+        pad_masks = []
+        att_masks = []
 
-        B, N_view, T, _, H, W = features.shape
-        embs = rearrange(features, 'b n t c h w -> b (n t h w) c', b=B, n=N_view, t=T)
-        # pad_masks = torch.ones((B, embs.shape[1]), dtype=torch.bool, device=device)
-        pad_masks = torch.zeros((B, N_view, T, H, W), dtype=torch.bool, device=device)
-        pad_masks[img_masks] = True
-        pad_masks = rearrange(pad_masks, 'b n t h w -> b (n t h w)', b=B, n=N_view, t=T)
+                # Process images
+        for img, img_mask in zip(images, img_masks, strict=True):
 
-        att_masks = [1] + [0] * (embs.shape[1] - 1)
-        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
-        att_masks = att_masks[None, :].expand(B, len(att_masks))
+            def image_embed_func(img):
+                #need modify
+                return self.spatial_encoder(img).flatten(1)
+
+            img_emb = self._apply_checkpoint(image_embed_func, img)
+
+            bsize, num_img_embs = img_emb.shape[:2]
+
+            embs.append(img_emb)
+            pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+
+            # Create attention masks so that image tokens attend to each other
+            att_masks += [0] * num_img_embs
+
         return embs, pad_masks, att_masks
 
     def embed_suffix(self, state, noisy_actions, timestep):
@@ -473,11 +472,6 @@ class OmniVLA(nn.Module):
         """Do a full training forward pass and compute the loss."""
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
         
-                # Prepare inputs
-        pixel_values = batch[f"{OBS_PREFIX}pixel_values"]
-        image_grid_thw = batch[f"{OBS_PREFIX}image_grid_thw"]
-        lang_tokens = batch[f"{OBS_PREFIX}input_ids"]
-        lang_masks = batch[f"{OBS_PREFIX}attention_mask"]
         
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -490,10 +484,10 @@ class OmniVLA(nn.Module):
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            pixel_values, image_grid_thw, lang_tokens, lang_masks
+            images, img_masks, lang_tokens, lang_masks
         )
         middle_embs, middle_pad_masks, middle_att_masks = self.embed_spatial(
-            images[:, :, :2], img_masks,  
+            images, img_masks,  
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(state, x_t, time)
 
