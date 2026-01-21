@@ -13,12 +13,38 @@ import openpi.models.gemma as _gemma
 from openpi.models_pytorch.g2vlm_pi0_pytorch import G2VLMWithActorExpertModel
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+from openpi.models_pytorch.vlm_with_spatial import VLMWithSpatialActionExpertModel
+from openpi.vggt.models.vggt import VGGT
 from openpi.vlm_expert.g2vlm.g2vlm import G2VLMConfig
 from openpi.models.pi0_config import Pi0Config
 from openpi.models_pytorch.omni_config import OmniConfig
 
+from einops import rearrange
+
 from ..data_vlm.data_utils import get_rope_index_image_3D
 from ..data_vlm.data_utils import get_rope_index_image_3D_dino
+
+OBS_STR = "observation"
+OBS_PREFIX = OBS_STR + "."
+OBS_ENV_STATE = OBS_STR + ".environment_state"
+OBS_STATE = OBS_STR + ".state"
+OBS_IMAGE = OBS_STR + ".image"
+OBS_IMAGES = OBS_IMAGE + "s"
+OBS_LANGUAGE = OBS_STR + ".language"
+OBS_LANGUAGE_TOKENS = OBS_LANGUAGE + ".tokens"
+OBS_LANGUAGE_ATTENTION_MASK = OBS_LANGUAGE + ".attention_mask"
+
+ACTION = "action"
+
+def pad_vector(vector, new_dim):
+    """Pad the last dimension of a vector to new_dim with zeros.
+
+    Can be (batch_size x sequence_length x features_dimension)
+    or (batch_size x features_dimension)
+    """
+    if vector.shape[-1] >= new_dim:
+        return vector
+    return F.pad(vector, (0, new_dim - vector.shape[-1]))
 
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
@@ -97,89 +123,47 @@ def make_att_2d_masks(pad_masks, att_masks):
 class OmniVLA(nn.Module):
     def __init__(self, config: OmniConfig, device: torch.device):
         """
-        Initialize from PI0Pytorch model config.
-        
-        Args:
-            config: Configuration object
-            g2vlm_model: Optional pre-initialized G2VLM model. If provided, will use G2VLM instead of PaliGemma.
+        Initialize Omni VLA
         """
         super().__init__()
         self.config = config
-        self.use_pre_g2vlm = config.use_pretrained_g2vlm
-
+        spatial_config = _gemma.get_config(config.spatial_expert_variant)
+        paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
-        g2_path = config.pretrained_g2vlm_path
-        g2_config_path = config.g2vlm_config_path
+
+        self.reasoning_spatial_expert = VLMWithSpatialActionExpertModel(
+            paligemma_config,
+            spatial_config,
+            action_expert_config,
+            precision=config.dtype,
+        )
+
+        self.spatial_encoder = VGGT(enable_camera=False,
+                                    enable_point=False,
+                                    enable_depth=False,
+                                    enable_track=False,
+                                    feature_only=True,
+                                ).to(device)
+        self.spatial_projector = nn.Linear(768, spatial_config.width).to(device)
 
         
 
-        # Try to import G2VLM adapter
-        try:
-            from ..models_pytorch.g2vlm_pi0_pytorch import G2VLMWithActorExpertModel
-            G2VLM_AVAILABLE = True
-        except ImportError:
-            G2VLM_AVAILABLE = False
-            #if g2vlm_model is not None:
-            raise ImportError("G2VLM Model Path pretrained need modifyed")
 
-        if G2VLM_AVAILABLE:
-            # Use G2VLM adapter
-            logging.info("Initializing OmniVLA with G2VLM...")
-            self.g2vlm_with_expert = G2VLMWithActorExpertModel(
-                g2_vlm_path=g2_config_path,
-                pretrained_g2vlm=self.use_pre_g2vlm,
-                action_expert_config=action_expert_config,
-                device=device,
-            )
-            logging.info("Using G2VLM adapter for PI-0 VLA")
-        else:
-            # Use PaliGemma (original)
-            logging.info("Using PaliGemma adapter for PI-0 VLA")
+        self.action_in_proj = nn.Linear(32, action_expert_config.width)
+        self.action_out_proj = nn.Linear(action_expert_config.width, 32)
 
 
-        device = self.g2vlm_with_expert.g2vlm.device
+        self.state_proj = nn.Linear(32, action_expert_config.width)
+        self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
+        self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
-        # need modify
-
-        for param in self.g2vlm_with_expert.g2vlm.dino_model.parameters():
-            param.requires_grad = False
-
-        for param in self.g2vlm_with_expert.g2vlm.vit_model.parameters():
-            param.requires_grad = False
-
-        for param in self.g2vlm_with_expert.g2vlm.language_model.parameters():
-            param.requires_grad = False
-
-        for param in self.g2vlm_with_expert.g2vlm.point_decoder.parameters():
-            param.requires_grad = False
-        
-        for param in self.g2vlm_with_expert.g2vlm.camera_decoder.parameters():
-            param.requires_grad = False
-
-        for param in self.g2vlm_with_expert.g2vlm.global_points_decoder.parameters():
-            param.requires_grad = False
-
-        hidden_size = self.g2vlm_with_expert.llm_config.hidden_size
-
-        self.action_in_proj = nn.Linear(32, hidden_size).to(device = device)
-        self.action_out_proj = nn.Linear(hidden_size, 32).to(device = device)
-
-        self.state_proj = nn.Linear(32, hidden_size).to(device = device)
-        self.action_time_mlp_in = nn.Linear(2 * hidden_size, hidden_size).to(device = device)
-        self.action_time_mlp_out = nn.Linear(hidden_size, hidden_size).to(device = device)
+        torch.set_float32_matmul_precision("high")
+        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
-        # # Compile model if requested
-        # if config.compile_model:
-        #     torch.set_float32_matmul_precision("high")
-        #     self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
-        #     # Also compile the main forward pass used during training
-        #     self.forward = torch.compile(self.forward, mode=config.compile_mode)
-
-        # msg = """An incorrect transformer version is used, please create an issue on https://github.com/huggingface/lerobot/issues"""
-
+        # msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
         # try:
         #     from transformers.models.siglip import check
 
@@ -187,37 +171,60 @@ class OmniVLA(nn.Module):
         #         raise ValueError(msg)
         # except ImportError:
         #     raise ValueError(msg) from None
+        
 
+    def set_requires_grad(self):
+        if self.config.freeze_vision_encoder:
+            self.reasoning_spatial_expert.visual.eval()
+            for params in self.reasoning_spatial_expert.und_expert.visual.parameters():
+                params.requires_grad = False
+
+        if self.config.train_expert_only:
+            self.reasoning_spatial_expert.und_expert.eval()
+            for params in self.reasoning_spatial_expert.und_expert.parameters():
+                params.requires_grad = False
+        
+        if self.config.train_vlm_only:
+            self.reasoning_spatial_expert.gen_expert.eval()
+            for params in self.reasoning_spatial_expert.gen_expert.parameters():
+                params.requires_grad = False
+            self.reasoning_spatial_expert.act_expert.eval()
+            for params in self.reasoning_spatial_expert.act_expert.parameters():
+                params.requires_grad = False
+        
+    
+    def train(self, mode: bool = True):
+        super().train(mode)
+
+        if self.config.freeze_vision_encoder:
+            self.reasoning_spatial_expert.reasoning_expert.vision_tower.eval()
+
+        if self.config.train_expert_only:
+            self.reasoning_spatial_expert.reasoning_expert.eval()
+            self.reasoning_spatial_expert.spatial_expert.eval()
+
+        if self.config.freeze_VGGT_model:
+            self.spatial_encoder.eval()
+        
+        return self
+    
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
-        if self.use_pre_g2vlm:
-            # G2VLM uses different structure
-            self.g2vlm_with_expert.g2vlm.language_model.gradient_checkpointing = True
-            self.g2vlm_with_expert.g2vlm.vit_model.gradient_checkpointing = True
-        # Also enable for DINO model if it exists
-            self.g2vlm_with_expert.g2vlm.dino_model.gradient_checkpointing = True
-        else:
-            # PaliGemma structure
-            logging.info("Paligemma structure")
-        logging.info("Enabled gradient checkpointing for PI0Pytorch model")
+        self.reasoning_spatial_expert.reasoning_expert.language_model.gradient_checkpointing = True
+        self.reasoning_spatial_expert.reasoning_expert.vision_tower.gradient_checkpointing = True
+        self.reasoning_spatial_expert.spatial_expert.model.gradient_checkpointing = True
+        self.reasoning_spatial_expert.action_expert.model.gradient_checkpointing = True
+        logging.info("Enabled gradient checkpointing for QwenA1 model")
 
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing."""
         self.gradient_checkpointing_enabled = False
-        if self.use_pre_g2vlm:
-            # G2VLM uses different structure
-            self.g2vlm_with_expert.g2vlm.language_model.gradient_checkpointing = False
-            self.g2vlm_with_expert.g2vlm.vit_model.gradient_checkpointing = False
-            # Also disable for DINO model if it exists
-            self.g2vlm_with_expert.g2vlm.dino_model.gradient_checkpointing = False
-        else:
-            # PaliGemma structure
-            logging.info("PaliGemma structure")
-        logging.info("Disabled gradient checkpointing for PI0Pytorch model")
-
-    def _rtc_enabled(self):
-        return self.config.rtc_config is not None and self.config.rtc_config.enabled
+        self.reasoning_spatial_expert.reasoning_expert.language_model.gradient_checkpointing = False
+        self.reasoning_spatial_expert.reasoning_expert.vision_tower.gradient_checkpointing = False
+        self.reasoning_spatial_expert.spatial_expert.model.gradient_checkpointing = False
+        self.reasoning_spatial_expert.action_expert.model.gradient_checkpointing = False
+        logging.info("Disabled gradient checkpointing for QwenA1 model")
 
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
@@ -231,28 +238,6 @@ class OmniVLA(nn.Module):
         """Helper method to prepare 4D attention masks for transformer."""
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
         return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
-    
-    def _preprocess_observation(self, observation, *, train=True):
-        """Helper method to preprocess observation."""
-        observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
-        return (
-            list(observation.images.values()),
-            list(observation.image_masks.values()),
-            observation.tokenized_prompt,
-            observation.tokenized_prompt_mask,
-            observation.state,
-        )
-        
-    def _preprocess_observation_g2vlm(self, observation, *, train=True):
-        """Helper method to preprocess observation for G2VLM."""
-        observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
-        return (
-            list(observation.images.values()),
-            list(observation.image_masks.values()),
-            observation.tokenized_prompt,
-            observation.tokenized_prompt_mask,
-            observation.state,
-        )
 
     def sample_noise(self, shape, device):
         return torch.normal(
@@ -265,63 +250,49 @@ class OmniVLA(nn.Module):
 
     def sample_time(self, bsize, device):
         time_beta = sample_beta(
-            1.5, 1.0, bsize, device
+            self.config.time_sampling_beta_alpha, self.config.time_sampling_beta_beta, bsize, device
         )
-        time = time_beta * 0.999 + 0.001
+        time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
         return time.to(dtype=torch.float32, device=device)
 
-    def embed_vlm_context(self, images, lang_tokens):
-        """调用 G2VLM 获取双流融合特征 [3, 4]"""
-        # G2VLM 会自动路由图像 Token 到语义和几何专家路径，并执行共享自注意力
-        outputs = self.g2vlm_with_expert.g2vlm(
-            input_ids=lang_tokens,
-            pixel_values=images,
-            output_hidden_states=True
-        )
-        # 获取最后的隐藏状态作为动作头的 context
-        # 这里包含了 G2VLM 预测的点云几何特征和语义特征
-        return outputs.last_hidden_state
-
-    def embed_prefix_old(
+    def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed images with SigLIP and language tokens with embedding layer."""
+        """Embed images with SigLIP and language tokens with embedding layer to prepare
+        for PaliGemma transformer processing.
+        """
         embs = []
         pad_masks = []
         att_masks = []
-        
-        print(type(images), len(images))
-        print(images[0].shape, images[0].dtype, images[0].min(), images[0].max())
-
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
 
             def image_embed_func(img):
-                return self.g2vlm_with_expert.embed_image(img)
+                return self.paligemma_with_expert.embed_image(img)
 
-            img_emb_dict = self._apply_checkpoint(image_embed_func, img)
-            # 旧方法需要合并 semantic 和 geometric tokens
-            semantic_tokens = img_emb_dict["semantic"]
-            geometric_tokens = img_emb_dict["geometric"]
-            img_emb = torch.cat([semantic_tokens, geometric_tokens], dim=1)
+            img_emb = self._apply_checkpoint(image_embed_func, img)
+
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+
+            # Create attention masks so that image tokens attend to each other
             att_masks += [0] * num_img_embs
 
         # Process language tokens
         def lang_embed_func(lang_tokens):
-            lang_emb = self.g2vlm_with_expert.embed_language_tokens(lang_tokens)
+            lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
             lang_emb_dim = lang_emb.shape[-1]
             return lang_emb * math.sqrt(lang_emb_dim)
 
-        # lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
-        lang_emb = lang_embed_func(lang_tokens=lang_tokens)
+        lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
+
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
 
+        # full attention between image and language inputs
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
@@ -329,83 +300,46 @@ class OmniVLA(nn.Module):
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
 
+        # Get batch size from the first dimension of the concatenated tensors
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
         return embs, pad_masks, att_masks
-    
-    def embed_prefix(self, images, img_masks, lang_tokens, lang_masks):
-        embs = []
-        pad_masks = []
-        att_masks = []
-        token_type_ids = []
 
-        # Add 20250110: 
-        self.current_vit_grid = []  # 新增：用于存储 ViT 的 grid_thw
-        self.current_dino_grid = [] # 新增：用于存储 DINO 的 grid_thw
+    def get_cosmos_features(self, images):
+        shape = images.shape[:-3]
+        c, h, w = images.shape[-3:]
+        images = images.reshape(-1, c, h, w)
+        images = F.interpolate(images, size=(256, 256), mode="bilinear", align_corners=False)
+        images = images * 2 - 1  # [-1, 1]
+        features = self.cosmos.encode(images)
+        c, h, w = features.shape[-3:]
+        features = features.view(*shape, c, h, w)
+        return features
 
-        batch_size = lang_tokens.size(0)  # 以语言 token batch 为标准
+    def embed_spatial(self, images, img_masks):
+        device = images[0].device
+        B, N_view, T = images.shape[:3]
+        features = self.get_cosmos_features(images)
+        
+        B, N_view, T = features.shape[:3]
+        features = rearrange(features, 'b n t c h w -> (b n t) c h w')
+        features = self.cosmos_in_proj(features)
+        features = self.downsample_conv(features) 
+        features = rearrange(features, '(b n t) c h w -> b n t c h w', b=B, n=N_view, t=T)
+        self.cosmos_feat_shape = features.shape
 
-        # Process images
-        for img, img_mask in zip(images, img_masks):
-            def image_embed_func(img):
-                return self.g2vlm_with_expert.embed_image(img)
-            img_emb_dict = self._apply_checkpoint(image_embed_func, img)
-            semantic_tokens = img_emb_dict["semantic"]
-            geometric_tokens = img_emb_dict["geometric"]
+        B, N_view, T, _, H, W = features.shape
+        embs = rearrange(features, 'b n t c h w -> b (n t h w) c', b=B, n=N_view, t=T)
+        # pad_masks = torch.ones((B, embs.shape[1]), dtype=torch.bool, device=device)
+        pad_masks = torch.zeros((B, N_view, T, H, W), dtype=torch.bool, device=device)
+        pad_masks[img_masks] = True
+        pad_masks = rearrange(pad_masks, 'b n t h w -> b (n t h w)', b=B, n=N_view, t=T)
 
-            # Add 20250110: 存储 grid 信息到 omni_vla 和 g2vlm_with_expert
-            self.current_vit_grid.append(img_emb_dict["vit_grid"]) 
-            self.current_dino_grid.append(img_emb_dict["dino_grid"])
-            # 同时存储到 g2vlm_with_expert，以便在 forward 中使用
-            if not hasattr(self.g2vlm_with_expert, 'current_vit_grid'):
-                self.g2vlm_with_expert.current_vit_grid = []
-                self.g2vlm_with_expert.current_dino_grid = []
-            self.g2vlm_with_expert.current_vit_grid.append(img_emb_dict["vit_grid"])
-            self.g2vlm_with_expert.current_dino_grid.append(img_emb_dict["dino_grid"])
-
-            # --- 🚀 诊断点 1：视觉分支 ---
-            print(f"DEBUG [Layer: Input]: semantic_tokens max: {semantic_tokens.abs().max().item():.4f}")
-            print(f"DEBUG [Layer: Input]: geometric_tokens max: {geometric_tokens.abs().max().item():.4f}")
-
-            # expand batch to match language tokens batch
-            if semantic_tokens.size(0) != batch_size:
-                semantic_tokens = semantic_tokens.expand(batch_size, -1, -1)
-            if geometric_tokens.size(0) != batch_size:
-                geometric_tokens = geometric_tokens.expand(batch_size, -1, -1)
-
-            embs.extend([semantic_tokens, geometric_tokens])
-            pad_masks.extend([
-                img_mask[:, None].expand(semantic_tokens.size(0), semantic_tokens.size(1)),
-                img_mask[:, None].expand(geometric_tokens.size(0), geometric_tokens.size(1))
-            ])
-            att_masks.extend([0] * (semantic_tokens.size(1) + geometric_tokens.size(1)))
-            # token type
-            token_type_ids.extend([0] * semantic_tokens.size(1))  # semantic
-            token_type_ids.extend([1] * geometric_tokens.size(1)) # geometric
-
-
-        # Process language tokens
-        lang_emb = self.g2vlm_with_expert.embed_language_tokens(lang_tokens)
-        # --- 🚀 诊断点 2：语言 Embedding ---
-        print(f"DEBUG [Layer: Input]: lang_emb (pre-scale) max: {lang_emb.abs().max().item():.4f}")
-        lang_emb = lang_emb * math.sqrt(lang_emb.size(-1))
-        print(f"DEBUG [Layer: Input]: lang_emb (post-scale) max: {lang_emb.abs().max().item():.4f}")
-
-        embs.append(lang_emb)
-        pad_masks.append(lang_masks)
-        att_masks.extend([0] * lang_emb.size(1))
-        token_type_ids.extend([2] * lang_emb.size(1))
-
-        # concat along token dimension
-        prefix_embeds = torch.cat(embs, dim=1)           # [B, N, D]
-        prefix_pad_masks = torch.cat(pad_masks, dim=1)   # [B, N]
-        prefix_att_masks = torch.tensor(att_masks, dtype=torch.bool, device=prefix_pad_masks.device)
-        prefix_att_masks = prefix_att_masks[None, :].expand(batch_size, len(att_masks))
-        prefix_token_type_ids = torch.tensor(token_type_ids, dtype=torch.long, device=prefix_pad_masks.device)
-        prefix_token_type_ids = prefix_token_type_ids[None, :].expand(batch_size, len(token_type_ids))
-
-        return prefix_embeds, prefix_pad_masks, prefix_att_masks, prefix_token_type_ids
+        att_masks = [1] + [0] * (embs.shape[1] - 1)
+        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
+        att_masks = att_masks[None, :].expand(B, len(att_masks))
+        return embs, pad_masks, att_masks
 
     def embed_suffix(self, state, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
@@ -413,9 +347,8 @@ class OmniVLA(nn.Module):
         pad_masks = []
         att_masks = []
 
-        device = self.state_proj.weight.device
-        if state.dtype != self.state_proj.weight.dtype or state.device != device:
-            state = state.to(dtype=self.state_proj.weight.dtype, device=device)
+        if self.state_proj.weight.dtype == torch.float32:
+            state = state.to(torch.float32)
 
         def state_proj_func(state):
             return self.state_proj(state)
@@ -423,34 +356,27 @@ class OmniVLA(nn.Module):
         state_emb = self._apply_checkpoint(state_proj_func, state)
         embs.append(state_emb[:, None, :])
         bsize = state_emb.shape[0]
-        # device = state_emb.device
+        device = state_emb.device
 
         state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
         pad_masks.append(state_mask)
         att_masks += [1]
 
         # Embed timestep using sine-cosine positional encoding
-        # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = create_sinusoidal_pos_embedding(
-            timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0, device=timestep.device
+            timestep,
+            self.action_in_proj.out_features,
+            min_period=self.config.min_period,
+            max_period=self.config.max_period,
+            device=timestep.device,
         )
         time_emb = time_emb.type(dtype=timestep.dtype)
-
-        if noisy_actions.dtype != self.action_in_proj.weight.dtype or noisy_actions.device != device:
-            noisy_actions = noisy_actions.to(dtype=self.action_in_proj.weight.dtype, device=device)
-
 
         # Fuse timestep + action information using an MLP
         def action_proj_func(noisy_actions):
             return self.action_in_proj(noisy_actions)
-        
-
 
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
-
-        if action_emb.device != device:
-            action_emb = action_emb.to(device = device)
-        
 
         time_emb = time_emb[:, None, :].expand_as(action_emb)
         action_time_emb = torch.cat([action_emb, time_emb], dim=2)
@@ -461,7 +387,6 @@ class OmniVLA(nn.Module):
             return self.action_time_mlp_out(x)
 
         action_time_emb = self._apply_checkpoint(mlp_func, action_time_emb)
-        adarms_cond = None
 
         embs.append(action_time_emb)
         bsize, action_time_dim = action_time_emb.shape[:2]
@@ -469,20 +394,91 @@ class OmniVLA(nn.Module):
         pad_masks.append(action_time_mask)
 
         # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] + ([0] * (self.config.action_horizon - 1))
+        att_masks += [1] + ([0] * (self.config.chunk_size - 1))
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
-        return embs, pad_masks, att_masks, adarms_cond
+        return embs, pad_masks, att_masks
 
+    def get_position_ids(self, lang_tokens, image_grid_thw, pad_masks): 
+        L = lang_tokens.shape[1]
+        pseudo_avail_token_id = 777
+        padded_lang_tokens = torch.ones_like(pad_masks).to(lang_tokens) * pseudo_avail_token_id
+        padded_lang_tokens[:, :L] = lang_tokens
+        attention_mask = pad_masks.to(lang_tokens)
+        if image_grid_thw is not None:
+            image_grid_thw = image_grid_thw.view(-1, 3)
+        position_ids, rope_deltas = self.reasoning_spatial_expert.und_expert.model.get_rope_index(
+            padded_lang_tokens, 
+            image_grid_thw, 
+            attention_mask=attention_mask, 
+        )
+        return position_ids, rope_deltas
 
-    def forward(self, observation, actions, noise=None, time=None) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+    def _preprocess_observation(self, observation, *, train=True):
+        """Helper method to preprocess observation."""
+        observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
+        return (
+            list(observation.images.values()),
+            list(observation.image_masks.values()),
+            observation.tokenized_prompt,
+            observation.tokenized_prompt_mask,
+            observation.state,
+        )
+    
+    def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
+        """Preprocess images for the model.
+        """
+        images = []
+        img_masks = []
+
+        for img_idx in range(3):
+            img = batch[f"{OBS_IMAGES}.image{img_idx}"]
+            mask = batch[f"{OBS_IMAGES}.image{img_idx}_mask"]
+
+            images.append(img)
+            img_masks.append(mask)
+        
+        images = torch.stack(images, dim=1)  # B, N_view, T, C, H, W
+        img_masks = torch.stack(img_masks, dim=1)
+
+        return images, img_masks
+    
+    def prepare_state(self, batch):
+        """Pad state"""
+        state = pad_vector(batch[OBS_STATE], self.config.max_state_dim)
+        return state
+
+    def prepare_action(self, batch):
+        """Pad action"""
+        actions = pad_vector(batch[ACTION], self.config.max_action_dim)
+        return actions
+    
+    def prepare_spatial_features(self, batch):
+        images = torch.stack([batch[f"{OBS_IMAGES}.image{i}"] for i in range(3)], dim=1)  # B, N_view, T, C, H, W
+        B, N_view, T = images.shape[:3]
+        images = rearrange(images, 'b n t c h w -> (b n t) c h w')
+        images = F.interpolate(images, size=(256, 256), mode="bilinear", align_corners=False)
+        images = images * 2 - 1  # [-1, 1]
+        features = self.model.cosmos.encode(images)
+        features = rearrange(features, '(b n t) c h w -> b n t c h w', b=B, n=N_view, t=T)
+        return features
+
+    def forward(
+        self, observation, actions, noise=None, time=None
+    ) -> Tensor:
+        """Do a full training forward pass and compute the loss."""
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
-
+        
+                # Prepare inputs
+        pixel_values = batch[f"{OBS_PREFIX}pixel_values"]
+        image_grid_thw = batch[f"{OBS_PREFIX}image_grid_thw"]
+        lang_tokens = batch[f"{OBS_PREFIX}input_ids"]
+        lang_masks = batch[f"{OBS_PREFIX}attention_mask"]
+        
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
@@ -492,107 +488,130 @@ class OmniVLA(nn.Module):
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
-        
-        
-        
-        prefix_embs, prefix_pad_masks, prefix_att_masks, prefix_token_type_ids  = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            pixel_values, image_grid_thw, lang_tokens, lang_masks
+        )
+        middle_embs, middle_pad_masks, middle_att_masks = self.embed_spatial(
+            images[:, :, :2], img_masks,  
+        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(state, x_t, time)
+
         if (
-            self.g2vlm_with_expert.g2vlm.language_model.base_model.layers[0].self_attn.q_proj.weight.dtype
+            self.reasoning_spatial_expert.reasoning_expert.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
         ):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+            middle_embs = middle_embs.to(dtype=torch.bfloat16)
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
-        # Add 20250110
-        # 收集构造 3D 索引所需的元数据
-        prefix_info = {
-            'batch_size': prefix_embs.shape[0],
-            'device': prefix_embs.device,
-            # 使用 torch.prod 计算 T*H*W，再 sum 起来
-            'vit_len': sum([torch.prod(g).item() for g in self.current_vit_grid]), 
-            'dino_len': sum([torch.prod(g).item() for g in self.current_dino_grid]),
-            'text_len': lang_tokens.shape[1],
-            'vit_grid': self.current_vit_grid,
-            'dino_grid': self.current_dino_grid,
-            'actual_prefix_len': prefix_embs.shape[1]  # 添加实际的 prefix 长度
-        }
+        pad_masks = torch.cat([prefix_pad_masks, middle_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, middle_att_masks, suffix_att_masks], dim=1)
 
-        print(f"DEBUG: prefix_embs shape: {prefix_embs.shape}")
-        print(f"DEBUG: suffix_embs shape: {suffix_embs.shape}")
-        print(f"DEBUG: vit_grid count: {len(self.current_vit_grid)}")
-        print(f"DEBUG: dino_grid count: {len(self.current_dino_grid)}")
-        position_ids = self.build_3d_position_ids(prefix_info, suffix_embs.shape[1])
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids, rope_deltas = self.get_position_ids(lang_tokens, image_grid_thw, pad_masks)
 
-        # --- 🚀 核心修改点：混合因果掩码 ---
-        # 替换原有的 make_att_2d_masks，注入 PI-0 的因果逻辑
-        att_2d_masks_4d = self.build_pi0_attention_mask(prefix_pad_masks, suffix_embs.shape[1])
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
-        # pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        # att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-
-        # att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        # position_ids = torch.cumsum(pad_masks, dim=1) - 1
-
-        # # Prepare attention masks
-        # att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
-
-        # Apply gradient checkpointing if enabled
-        def forward_func(observation, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.g2vlm_with_expert.forward(
-                observation = observation,
+        def forward_func(prefix_embs, middle_embs, suffix_embs, att_2d_masks_4d, position_ids):
+            (_, middle_out, suffix_out), _ = self.reasoning_spatial_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
-                inputs_embeds=[prefix_embs, suffix_embs],
+                inputs_embeds=[prefix_embs, middle_embs, suffix_embs],
                 use_cache=False,
-                adarms_cond=[None, adarms_cond],
             )
-            return suffix_out
+            return middle_out, suffix_out
 
-        suffix_out = self._apply_checkpoint(
-            forward_func, observation, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        middle_out, suffix_out = self._apply_checkpoint(
+            forward_func, prefix_embs, middle_embs, suffix_embs, att_2d_masks_4d, position_ids
         )
 
-        suffix_out = suffix_out[:, -self.config.action_horizon :]
+        def cosmos_out_func(middle_out):
+            return self.decode_cosmos(middle_out)
+        
+        pred_cosmos_features = self._apply_checkpoint(cosmos_out_func, middle_out.to(dtype=torch.float32))
+
+        future_embs = self.get_cosmos_features(images[:, :, 2])
+        loss_gen = F.mse_loss(pred_cosmos_features[img_masks], future_embs.to(dtype=torch.float32)[img_masks])
+
+        suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
 
-        # Apply gradient checkpointing to final action projection if enabled
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        loss_action = F.mse_loss(u_t, v_t, reduction="none")
 
-    @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
-        bsize = observation.state.shape[0]
+        return loss_action, loss_gen
+
+    @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
+    def sample_actions(
+        self, images, img_masks, pixel_values, image_grid_thw, lang_tokens, lang_masks, state, noise=None, num_steps=None, decode_image=False
+    ) -> Tensor:
+        """Do a full inference forward and compute the action."""
+        if num_steps is None:
+            num_steps = self.config.num_inference_steps
+
+        bsize = state.shape[0]
+        device = state.device
+        dtype = state.dtype
+
         if noise is None:
-            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
+            # Sample noise with padded dimension as expected by action_in_proj
+            actions_shape = (
+                bsize,
+                self.config.chunk_size,
+                self.config.max_action_dim,
+            )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
-
-        prefix_embs, prefix_pad_masks, prefix_att_masks, prefix_token_type_ids = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            pixel_values, image_grid_thw, lang_tokens, lang_masks
+        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_position_ids, rope_deltas = self.get_position_ids(lang_tokens, image_grid_thw, prefix_pad_masks)
 
-        # Compute image and language key value cache
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        # Set attention implementation (only for PaliGemma)
-        if not self.use_pre_g2vlm:
-            self.g2vlm_with_expert.action_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.reasoning_spatial_expert.und_expert.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        _, past_key_values = self.g2vlm_with_expert.forward(
-            observation = observation,
+        _, past_key_values = self.reasoning_spatial_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
             past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
+            inputs_embeds=[prefix_embs, None, None],
             use_cache=True,
         )
+        max_prefix_position_ids = prefix_position_ids.max(dim=-1, keepdim=True).values
+
+        middle_embs, middle_pad_masks, middle_att_masks = self.embed_middle(
+            images[:, :, :2], img_masks, 
+        )
+
+        middle_len = middle_pad_masks.shape[1]
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, middle_len, prefix_len)
+        middle_att_2d_masks = make_att_2d_masks(middle_pad_masks, middle_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, middle_att_2d_masks], dim=2)
+
+        middle_position_ids = torch.arange(1, middle_len + 1).repeat(3, 1, 1).to(max_prefix_position_ids) + max_prefix_position_ids
+
+        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+        self.reasoning_spatial_expert.gen_expert.config._attn_implementation = "eager"  # noqa: SLF001
+
+        (_, middle_out, _), past_key_values = self.reasoning_spatial_expert.forward(
+            attention_mask=full_att_2d_masks_4d,
+            position_ids=middle_position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[None, middle_embs, None],
+            use_cache=True,
+        )
+
+        max_position_ids = middle_position_ids.max(dim=-1, keepdim=True).values
+        curr_pad_masks = torch.cat([prefix_pad_masks, middle_pad_masks], dim=1)
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -603,171 +622,60 @@ class OmniVLA(nn.Module):
             expanded_time = time.expand(bsize)
             v_t = self.denoise_step(
                 state,
-                prefix_pad_masks,
+                curr_pad_masks,
                 past_key_values,
-                x_t,
-                expanded_time,
+                max_position_ids, 
+                x_t.to(dtype),
+                expanded_time.to(dtype),
             )
-
-            # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
             time += dt
-        return x_t
+
+        if decode_image:
+            def cosmos_out_func(middle_out):
+                return self.decode_cosmos(middle_out)
+            pred_cosmos_features = self._apply_checkpoint(cosmos_out_func, middle_out.to(dtype=torch.bfloat16))
+            pred_cosmos_features = pred_cosmos_features.squeeze(0)
+            recon_images = self.cosmos.decode(pred_cosmos_features.squeeze(0))
+        else:
+            recon_images = None
+
+        return x_t, recon_images
 
     def denoise_step(
         self,
         state,
         prefix_pad_masks,
         past_key_values,
+        max_prefix_position_ids, 
         x_t,
         timestep,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(state, x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1]
 
         prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
-
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
 
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        position_ids = torch.arange(1, suffix_len + 1).repeat(3, 1, 1).to(max_prefix_position_ids) + max_prefix_position_ids
 
-        # Prepare attention masks
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        # Set attention implementation (only for PaliGemma)
-        if not self.use_pre_g2vlm:
-            self.g2vlm_with_expert.action_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.reasoning_spatial_expert.act_expert.config._attn_implementation = "eager"  # noqa: SLF001
 
-        outputs_embeds, _ = self.g2vlm_with_expert.forward(
+        outputs_embeds, _ = self.reasoning_spatial_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            inputs_embeds=[None, suffix_embs],
+            inputs_embeds=[None, None, suffix_embs],
             use_cache=False,
-            adarms_cond=[None, adarms_cond],
         )
 
-        suffix_out = outputs_embeds[1]
-        suffix_out = suffix_out[:, -self.config.action_horizon :]
+        suffix_out = outputs_embeds[2]
+        suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         return self.action_out_proj(suffix_out)
-    
-    # Add 20250110
-    # 把这些分散的 grid_thw 拼成一个完整的 3D 坐标系
-    def build_3d_position_ids(self, prefix_info, suffix_len):
-        b = prefix_info['batch_size']
-        device = prefix_info['device']
-        curr_pos_val = 0  # 建议换个变量名，避免混淆
-
-        # 1. 语义索引 (ViT)
-        all_vit_pos = []
-        for grid in prefix_info['vit_grid']:
-            # 🚀 修复点：将 curr_pos 改为 curr_position_id
-            # pos_3d, delta = get_rope_index_image_3D(
-            #     grid.flatten(), 
-            #     curr_position_id=curr_pos_val 
-            # )
-            pos_3d, delta = get_rope_index_image_3D(grid.flatten()[:3], curr_position_id=curr_pos_val)
-            all_vit_pos.append(pos_3d.unsqueeze(1).repeat(1, b, 1))
-            curr_pos_val += int(delta) + 1
-
-        # 2. 几何索引 (DINO)
-        all_dino_pos = []
-        for grid in prefix_info['dino_grid']:
-            # 🚀 同样修复这里的参数名
-            # pos_3d, delta = get_rope_index_image_3D_dino(
-            #     grid.flatten(), 
-            #     curr_position_id=curr_pos_val
-            # )
-            pos_3d, delta = get_rope_index_image_3D(grid.flatten()[:3], curr_position_id=curr_pos_val)
-            all_dino_pos.append(pos_3d.unsqueeze(1).repeat(1, b, 1))
-            curr_pos_val += int(delta) + 1
-
-        # # 3. 文本与动作 (线性 T 轴)
-        # text_act_len = prefix_info['text_len'] + suffix_len
-        # # 从最后的 curr_pos_val 开始递增
-        # incremental_ids = torch.arange(curr_pos_val, curr_pos_val + text_act_len, device=device)
-        
-        # t_axis = incremental_ids.unsqueeze(0).repeat(b, 1)
-        # h_axis = torch.zeros_like(t_axis)
-        # w_axis = torch.zeros_like(t_axis)
-        # text_act_pos = torch.stack([t_axis, h_axis, w_axis], dim=0)
-
-        # # 4. 拼接全序列
-        # full_vit_pos = torch.cat(all_vit_pos, dim=-1)
-        # full_dino_pos = torch.cat(all_dino_pos, dim=-1)
-
-        # 3. 文本索引
-        # 💡 这里要动态计算文本的真实长度，防止 text_len 不准
-        # 总 prefix 长度 - 已分配的视觉长度 = 文本长度
-        current_vision_len = sum([p.shape[-1] for p in all_vit_pos]) + sum([p.shape[-1] for p in all_dino_pos])
-        # 从 prefix_info 中获取实际的 prefix 长度，如果没有则从 text_len 和视觉长度计算
-        actual_prefix_len = prefix_info.get('actual_prefix_len', current_vision_len + prefix_info.get('text_len', 0))
-        text_len = actual_prefix_len - current_vision_len
-        
-        # 4. 拼接文本和动作 (Suffix)
-        total_incremental_len = text_len + suffix_len
-        incremental_ids = torch.arange(curr_pos_val, curr_pos_val + total_incremental_len, device=device)
-        text_act_pos = incremental_ids.unsqueeze(0).unsqueeze(0).repeat(3, b, 1)
-
-        # 5. 拼接全序列
-        full_pos = torch.cat(all_vit_pos + all_dino_pos + [text_act_pos], dim=-1)
-
-        # 🚨 最终断言：如果还是不等于 2403，说明拼接逻辑有根本性误解
-        assert full_pos.shape[-1] == (actual_prefix_len + suffix_len), \
-            f"Length Mismatch: PosIDs {full_pos.shape[-1]} != Embeds {actual_prefix_len + suffix_len}"
-            
-        return full_pos.to(device)
-        
-        # return torch.cat([full_vit_pos, full_dino_pos, text_act_pos], dim=-1).to(device)
-
-    # Add 20250110
-    # 把 prefix_pad_masks 扩展，并注入因果性
-    def build_pi0_attention_mask(self, prefix_pad_masks, suffix_len):
-        """
-        prefix_pad_masks: [B, prefix_L] (你 embed_prefix 返回的那个)
-        suffix_len: 动作长度
-        """
-        b, prefix_len = prefix_pad_masks.shape
-        total_len = prefix_len + suffix_len
-        device = prefix_pad_masks.device
-
-        # 1. 构造 2D 基础掩码 [B, total_L, total_L]
-        # 先初始化为全 True (可见)
-        mask_2d = torch.ones((b, total_len, total_len), dtype=torch.bool, device=device)
-
-        # 2. 处理 Padding (视觉/文本可能存在补齐)
-        # 让所有 Token 遵守 prefix 的 padding 规则
-        prefix_mask_expanded = prefix_pad_masks.unsqueeze(1).expand(-1, total_len, -1)
-        mask_2d[:, :, :prefix_len] &= prefix_mask_expanded
-
-        # 3. 注入因果律 (动作不能看未来)
-        # 仅对 Suffix 区域应用下三角掩码
-        causal_mask = torch.tril(torch.ones((suffix_len, suffix_len), device=device, dtype=torch.bool))
-        # 动作区（右下角）
-        mask_2d[:, prefix_len:, prefix_len:] &= causal_mask
-
-        # 4. ❗VLA 关键：prefix 不能看 action
-        mask_2d[:, :prefix_len, prefix_len:] = False
-
-        # mask = mask_2d[0].int()   # 取第一个 batch，True/False → 1/0
-        # print(mask)
-
-        # plt.figure(figsize=(6, 6))
-        # plt.imshow(mask_2d[0].cpu(), cmap="gray")
-        # plt.axvline(prefix_len - 0.5, color="red")
-        # plt.axhline(prefix_len - 0.5, color="red")
-        # plt.title("VLA Attention Mask")
-
-        # plt.savefig("vla_attention_mask.png", dpi=200, bbox_inches="tight")
-        # plt.close()   # 很重要，防止显存/句柄泄露
-
-
-        # 4. 映射为数值掩码 (-inf)
-        return self._prepare_attention_masks_4d(mask_2d)

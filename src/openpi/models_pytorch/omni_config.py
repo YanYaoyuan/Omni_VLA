@@ -34,6 +34,11 @@ class OmniConfig(_pi0_config.Pi0Config):
     # PI0 / PI05 行为
     pi05: bool = False
 
+    freeze_vision_encoder : bool = True
+    freeze_language_model : bool = True
+    freeze_VGGT_model : bool = True
+    train_expert_only : bool = False
+
     # ------------------------------------------------------------------
     # 训练 / 冻结策略
     # ------------------------------------------------------------------

@@ -20,6 +20,7 @@ class Pi0Config(_model.BaseModelConfig):
     dtype: str = "bfloat16"
     paligemma_variant: _gemma.Variant = "gemma_2b"
     action_expert_variant: _gemma.Variant = "gemma_300m"
+    spatial_expert_variant: _gemma.Variant = "gemma_300m"
 
     # Set the model specific defaults.
     action_dim: int = 32
@@ -31,6 +32,11 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+
+    freeze_vision_encoder : bool = True
+    freeze_language_model : bool = True
+    freeze_VGGT_model : bool = True
+    train_expert_only : bool = False
 
     def __post_init__(self):
         if self.max_token_len is None:

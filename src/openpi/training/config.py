@@ -698,6 +698,7 @@ _CONFIGS = [
         #     paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         # ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning.
+        wandb_enabled=False,
         ema_decay=None,
     ),
     TrainConfig(
