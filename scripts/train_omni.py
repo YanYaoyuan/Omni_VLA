@@ -749,14 +749,21 @@ def train_loop(config: _config.TrainConfig):
             print(f"Training: {name}")
 
     # Prepare inputs
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # 兼容单 GPU / DDP
+    model_to_use = getattr(model, "module", model)
+
+    # 总参数
+    total_params = sum(p.numel() for p in model_to_use.parameters())
+    trainable_params = sum(p.numel() for p in model_to_use.parameters() if p.requires_grad)
+
     print(f"\nTotal parameters: {total_params:,}  ({total_params / 1e9:.2f}B)")
     print(f"Trainable parameters: {trainable_params:,}  ({trainable_params / 1e9:.2f}B)")
-    print(f"Reasoning params: {sum(p.numel() for p in model.reasoning_spatial_expert.reasoning_expert.parameters()) / 1e9:.2f}B")
-    print(f"Spatial params: {sum(p.numel() for p in model.reasoning_spatial_expert.spatial_expert.parameters()) / 1e9:.2f}B")
-    print(f"Action params: {sum(p.numel() for p in model.reasoning_spatial_expert.action_expert.parameters()) / 1e9:.2f}B")
-    print(f"Spatial Encoder params: {sum(p.numel() for p in model.spatial_encoder.parameters()) / 1e9:.2f}B")
+
+    # 专家模块参数
+    print(f"Reasoning params: {sum(p.numel() for p in model_to_use.reasoning_spatial_expert.reasoning_expert.parameters()) / 1e9:.2f}B")
+    print(f"Spatial params: {sum(p.numel() for p in model_to_use.reasoning_spatial_expert.spatial_expert.parameters()) / 1e9:.2f}B")
+    print(f"Action params: {sum(p.numel() for p in model_to_use.reasoning_spatial_expert.action_expert.parameters()) / 1e9:.2f}B")
+    print(f"Spatial Encoder params: {sum(p.numel() for p in model_to_use.reasoning_spatial_expert.vggt_encoder.parameters()) / 1e9:.2f}B")
 
 
     while global_step < config.num_train_steps:

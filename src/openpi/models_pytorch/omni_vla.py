@@ -138,15 +138,11 @@ class OmniVLA(nn.Module):
             precision=config.dtype,
         )
 
-        self.spatial_encoder = VGGT(enable_camera=False,
-                                    enable_point=False,
-                                    enable_depth=False,
-                                    enable_track=False,
-                                    feature_only=True,
-                                ).to(device)
-        self.spatial_projector = nn.Linear(768, spatial_config.width).to(device)
+        dtype = next(self.reasoning_spatial_expert.vggt_encoder.parameters()).dtype
+        self.spatial_to_reasoning = torch.nn.Linear(2048, 1024, dtype=dtype)
 
-        
+
+
 
 
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
@@ -162,6 +158,18 @@ class OmniVLA(nn.Module):
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
+
+        # 硬编码冻结
+        for param in self.reasoning_spatial_expert.vggt_encoder.parameters():
+            param.requires_grad = False
+
+        # 冻结langugae
+        for param in self.reasoning_spatial_expert.reasoning_expert.language_model.parameters():
+            param.requires_grad = False
+
+        # 冻结spatial
+        for param in self.reasoning_spatial_expert.spatial_expert.parameters():
+            param.requires_grad = False
 
         # msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
         # try:
@@ -204,7 +212,7 @@ class OmniVLA(nn.Module):
             self.reasoning_spatial_expert.spatial_expert.eval()
 
         if self.config.freeze_VGGT_model:
-            self.spatial_encoder.eval()
+            self.reasoning_spatial_expert.vggt_encoder.eval()
         
         return self
     
@@ -315,30 +323,98 @@ class OmniVLA(nn.Module):
         features = features.view(*shape, c, h, w)
         return features
 
-    def embed_spatial(self, images, img_masks):
+    def embed_spatial_old(self, images, img_masks):
         """Embed spatial images to prepare for Expert Gemma processing."""
-        embs = []
-        pad_masks = []
-        att_masks = []
+        # 1. 准备图像张量 [B, S, C, H, W]
+        images_tensor = torch.stack(images, dim=1)
+        images_tensor = images_tensor.to(dtype=next(self.reasoning_spatial_expert.vggt_encoder.parameters()).dtype)
+        B, S, C, H, W = images_tensor.shape
 
-                # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
+        # 2. 修复 Mask 处理逻辑
+        # img_masks 现在是一个 list, 里面每个元素是 [B, S] 的 bool
+        # 我们需要的是 [B, S, H, W]
+        if isinstance(img_masks, list):
+            # 即使堆叠后也只是 [B, S]，没有 H, W 维度
+            mask_tensor = torch.stack(img_masks, dim=1).to(images_tensor.device) # [B, S]
+        else:
+            mask_tensor = img_masks.to(images_tensor.device)
 
-            def image_embed_func(img):
-                #need modify
-                return self.spatial_encoder(img).flatten(1)
+        # 重点：将 [B, S] 扩展到 [B, S, H, W]
+        # 使用 .unsqueeze(-1).unsqueeze(-1) 增加维度，然后用 .expand 填充空间
+        full_spatial_masks = mask_tensor.unsqueeze(-1).unsqueeze(-1).expand(B, S, H, W)
 
-            img_emb = self._apply_checkpoint(image_embed_func, img)
+        # 3. 接下来进行正常的下采样逻辑 (Patch Size = 14)
+        gh, gw = H // 14, W // 14
+        
+        # 将 [B, S, H, W] -> [B*S, 1, H, W]
+        flat_masks = full_spatial_masks.reshape(B * S, 1, H, W).float()
+        
+        # 下采样到 Patch 级别
+        down_masks = torch.nn.functional.interpolate(flat_masks, size=(gh, gw), mode='nearest')
+        
+        # 最终对齐到 Token 数量: [B, S * gh * gw]
+        pad_masks = down_masks.view(B, S * gh * gw).to(torch.bool)
 
-            bsize, num_img_embs = img_emb.shape[:2]
+        # 4. VGGT 特征提取
+        def image_embed_func(img):
+            # 注意：这里传入的 img 是 [B, S, C, H, W]
+            res = self.reasoning_spatial_expert.vggt_encoder(img)
+            # 确保返回的是视觉 token 序列
+            return res["features"][-1] 
 
-            embs.append(img_emb)
-            pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+        img_emb = self._apply_checkpoint(image_embed_func, images_tensor)
+        B_t, S_t, N_t, D_t = img_emb.shape
+        img_emb = img_emb.view(B_t, S_t * N_t, D_t) 
+        # 这里的 att_masks 通常和 pad_masks 一致
 
-            # Create attention masks so that image tokens attend to each other
-            att_masks += [0] * num_img_embs
+        att_masks = torch.zeros_like(pad_masks, dtype=torch.bool)
 
-        return embs, pad_masks, att_masks
+        return img_emb, pad_masks, att_masks
+    
+    def embed_spatial(self, images, img_masks):
+        """Embed spatial images，输出与 embed_prefix 完全兼容"""
+        # 1. 准备图像张量 [B, S, C, H, W]
+        images_tensor = torch.stack(images, dim=1)
+        images_tensor = images_tensor.to(
+            dtype=next(self.reasoning_spatial_expert.vggt_encoder.parameters()).dtype
+        )
+        B, S, C, H, W = images_tensor.shape
+
+        # 2. 修复 Mask 处理逻辑
+        if isinstance(img_masks, list):
+            mask_tensor = torch.stack(img_masks, dim=1).to(images_tensor.device)  # [B, S]
+        else:
+            mask_tensor = img_masks.to(images_tensor.device)
+
+        # 扩展到 [B, S, H, W]
+        full_spatial_masks = mask_tensor.unsqueeze(-1).unsqueeze(-1).expand(B, S, H, W)
+
+        # 3. 下采样到 Patch 级别 (Patch Size = 14)
+        gh, gw = H // 14, W // 14
+        flat_masks = full_spatial_masks.reshape(B * S, 1, H, W).float()
+        down_masks = torch.nn.functional.interpolate(flat_masks, size=(gh, gw), mode='nearest')
+        pad_masks = down_masks.view(B, S * gh * gw).to(torch.bool)
+
+        # 4. VGGT 特征提取
+        def image_embed_func(img):
+            # 输入 [B, S, C, H, W]，返回 [B, S, num_tokens, emb_dim]
+            res = self.reasoning_spatial_expert.vggt_encoder(img)
+            return res["features"][-1]  # [B, S, num_tokens, emb_dim]
+
+        img_emb = self._apply_checkpoint(image_embed_func, images_tensor)  # [B, S, N, D]
+
+        # 5. Flatten 序列到 [B, seq_len, emb_dim]
+        B, S, N, D = img_emb.shape
+        img_emb = img_emb.view(B, S * N, D)  # [B, S*N, D]
+
+        # 6. 构建 attention mask，全 attention
+        att_masks = torch.zeros_like(pad_masks, dtype=torch.bool)  # [B, S*N]
+
+        img_emb = self.spatial_to_reasoning(img_emb)  # [B, seq_len, 1024]
+
+
+        return img_emb, pad_masks, att_masks
+
 
     def embed_suffix(self, state, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
@@ -365,8 +441,8 @@ class OmniVLA(nn.Module):
         time_emb = create_sinusoidal_pos_embedding(
             timestep,
             self.action_in_proj.out_features,
-            min_period=self.config.min_period,
-            max_period=self.config.max_period,
+            min_period=4e-3,
+            max_period=4.0,
             device=timestep.device,
         )
         time_emb = time_emb.type(dtype=timestep.dtype)
@@ -393,7 +469,7 @@ class OmniVLA(nn.Module):
         pad_masks.append(action_time_mask)
 
         # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] + ([0] * (self.config.chunk_size - 1))
+        att_masks += [1] + ([0] * (self.config.action_horizon - 1))
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -492,7 +568,7 @@ class OmniVLA(nn.Module):
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(state, x_t, time)
 
         if (
-            self.reasoning_spatial_expert.reasoning_expert.language_model.layers[0].self_attn.q_proj.weight.dtype
+            self.reasoning_spatial_expert.reasoning_expert.language_model.model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
         ):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
@@ -503,7 +579,9 @@ class OmniVLA(nn.Module):
         att_masks = torch.cat([prefix_att_masks, middle_att_masks, suffix_att_masks], dim=1)
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids, rope_deltas = self.get_position_ids(lang_tokens, image_grid_thw, pad_masks)
+        # position_ids, rope_deltas = self.get_position_ids(lang_tokens, image_grid_thw, pad_masks)
+        # 先用PI0
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
@@ -521,16 +599,19 @@ class OmniVLA(nn.Module):
             forward_func, prefix_embs, middle_embs, suffix_embs, att_2d_masks_4d, position_ids
         )
 
-        def cosmos_out_func(middle_out):
-            return self.decode_cosmos(middle_out)
+        # def cosmos_out_func(middle_out):
+        #     return self.decode_cosmos(middle_out)
         
-        pred_cosmos_features = self._apply_checkpoint(cosmos_out_func, middle_out.to(dtype=torch.float32))
+        # pred_cosmos_features = self._apply_checkpoint(cosmos_out_func, middle_out.to(dtype=torch.float32))
 
-        future_embs = self.get_cosmos_features(images[:, :, 2])
-        loss_gen = F.mse_loss(pred_cosmos_features[img_masks], future_embs.to(dtype=torch.float32)[img_masks])
+        # future_embs = self.get_cosmos_features(images[:, :, 2])
+        # loss_gen = F.mse_loss(pred_cosmos_features[img_masks], future_embs.to(dtype=torch.float32)[img_masks])
 
-        suffix_out = suffix_out[:, -self.config.chunk_size :]
+        suffix_out = suffix_out[:, -36 :]
         suffix_out = suffix_out.to(dtype=torch.float32)
+
+        u_t = u_t[:, -36 :]
+
 
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
@@ -539,7 +620,7 @@ class OmniVLA(nn.Module):
 
         loss_action = F.mse_loss(u_t, v_t, reduction="none")
 
-        return loss_action, loss_gen
+        return loss_action
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(

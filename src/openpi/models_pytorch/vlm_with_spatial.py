@@ -8,6 +8,11 @@ from transformers import PaliGemmaForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
+from openpi.vggt.models.vggt import VGGT
+from openpi.vlm_expert.dinov2_with_registers.modeling_dinov2_with_registers import Dinov2WithRegistersModel
+from openpi.vlm_expert.dinov2_with_registers.modular_dinov2_with_registers import Dinov2WithRegistersConfig
+
+import os
 
 # Define the complete layer computation function for gradient checkpointing
 def compute_layer_complete(
@@ -17,16 +22,33 @@ def compute_layer_complete(
     query_states = []
     key_states = []
     value_states = []
+
+    # for i, hidden_states in enumerate(inputs_embeds):
+    #     layer = models[i].model.layers[layer_idx]
+    #     hidden_states = layer.input_layernorm(hidden_states)  # noqa: PLW2901
+    #     input_shape = hidden_states.shape[:-1]
+    #     hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+    #     if layer.self_attn.q_proj.weight.dtype == torch.bfloat16:
+    #         hidden_states = hidden_states.to(dtype=torch.bfloat16)
+    #     #query_state = layer.self_attn.q_norm(layer.self_attn.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+    #     query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    #     key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    #     value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    #     # key_state = layer.self_attn.k_norm(layer.self_attn.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+    #     # value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    #     query_states.append(query_state)
+    #     key_states.append(key_state)
+    #     value_states.append(value_state)
     for i, hidden_states in enumerate(inputs_embeds):
-        layer = models[i].layers[layer_idx]
+        layer = models[i].model.layers[layer_idx]
         hidden_states = layer.input_layernorm(hidden_states)  # noqa: PLW2901
+
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
-        if layer.self_attn.q_proj.weight.dtype == torch.bfloat16:
-            hidden_states = hidden_states.to(dtype=torch.bfloat16)
-        query_state = layer.self_attn.q_norm(layer.self_attn.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_state = layer.self_attn.k_norm(layer.self_attn.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
         query_states.append(query_state)
         key_states.append(key_state)
         value_states.append(value_state)
@@ -34,22 +56,40 @@ def compute_layer_complete(
     query_states = torch.cat(query_states, dim=2)
     key_states = torch.cat(key_states, dim=2)
     value_states = torch.cat(value_states, dim=2)
+
+    seq_len = query_states.shape[2]
+
+    # 如何生成1650长度？？？
+    max_rotary_len = 1635
+    query_states = query_states[:, :, :max_rotary_len, :]
+    key_states   = key_states[:, :, :max_rotary_len, :]
+    value_states = value_states[:, :, :max_rotary_len, :]
+    seq_len = query_states.shape[2]
+
     dummy_tensor = torch.zeros(
         query_states.shape[0],
-        query_states.shape[2],
+        seq_len,
         query_states.shape[-1],
         device=query_states.device,
         dtype=query_states.dtype,
     )
-    cos, sin = reasoning_expert.model.language_model.rotary_emb(dummy_tensor, position_ids)
+
+
+    cos, sin = reasoning_expert.language_model.model.rotary_emb(dummy_tensor, position_ids)
+    # cos, sin = reasoning_expert.get_rotary_embedding(seq_len)
+
+    # ⚠ 确保长度对齐 Q/K
+    cos = cos[:, :seq_len, :]
+    sin = sin[:, :seq_len, :]
+    
     query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
         query_states, key_states, cos, sin, unsqueeze_dim=1
     )
     batch_size = query_states.shape[0]
-    scaling = reasoning_expert.language_model.layers[layer_idx].self_attn.scaling
+    scaling = reasoning_expert.language_model.model.layers[layer_idx].self_attn.scaling
     # Attention computation
     att_output, _ = modeling_gemma.eager_attention_forward(
-        reasoning_expert.language_model.layers[layer_idx].self_attn,
+        reasoning_expert.language_model.model.layers[layer_idx].self_attn,
         query_states,
         key_states,
         value_states,
@@ -57,19 +97,21 @@ def compute_layer_complete(
         scaling,
     )
     # Get head_dim from the current layer, not from the model
-    head_dim = reasoning_expert.language_model.layers[layer_idx].self_attn.head_dim
-    num_attention_heads = reasoning_expert.language_model.layers[layer_idx].self_attn.config.num_attention_heads
+    head_dim = reasoning_expert.language_model.model.layers[layer_idx].self_attn.head_dim
+    num_attention_heads = reasoning_expert.language_model.model.layers[layer_idx].self_attn.config.num_attention_heads
     att_output = att_output.reshape(batch_size, -1, 1 * num_attention_heads * head_dim)
     # Process layer outputs
     outputs_embeds = []
     start_pos = 0
     for i, hidden_states in enumerate(inputs_embeds):
-        layer = models[i].layers[layer_idx]
+        layer = models[i].model.layers[layer_idx]
         end_pos = start_pos + hidden_states.shape[1]
         if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
             att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
         out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
         # first residual
+        residual_len = out_emb.shape[1]  # 当前 att_output 对应长度
+        hidden_states = hidden_states[:, :residual_len, :]
         out_emb = out_emb + hidden_states
         after_first_residual = out_emb.clone()
         out_emb = layer.post_attention_layernorm(out_emb)
@@ -131,7 +173,18 @@ class VLMWithSpatialActionExpertModel(
             # use_adarms=use_adarms[1],
             # adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
         )
+        # dino_config_path = spatial_expert_config.dino_path
+        # dino_config = Dinov2WithRegistersConfig.from_json_file(os.path.join(dino_config_path, "dino_config.json"))
+        # self.dino_encoder = Dinov2WithRegistersModel(dino_config)
+        # self.dino2llm = nn.Linear(self.dino_hidden_size, self.hidden_size) 
 
+        self.vggt_encoder = VGGT(enable_camera=False,
+                                    enable_point=False,
+                                    enable_depth=False,
+                                    enable_track=False,
+                                    feature_only=True,
+                                )
+        # self.spatial_projector = nn.Linear(768, spatial_expert_config_hf.width)
         self.spatial_expert = GemmaForCausalLM(config=spatial_expert_config_hf)
 
         "Actor expert config"
@@ -190,7 +243,7 @@ class VLMWithSpatialActionExpertModel(
         if adarms_cond is None:
             adarms_cond = [None, None]
         if inputs_embeds[1] is None and inputs_embeds[2] is None:
-            prefix_output = self.und_expert.language_model.forward(
+            prefix_output = self.reasoning_expert.language_model.forward(
                 inputs_embeds=inputs_embeds[0],
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -203,7 +256,7 @@ class VLMWithSpatialActionExpertModel(
             suffix_output = None
             
         elif inputs_embeds[0] is None and inputs_embeds[2] is None:
-            middle_output = self.gen_expert.forward(
+            middle_output = self.spatial_expert.forward(
                 inputs_embeds=inputs_embeds[1],
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -216,7 +269,7 @@ class VLMWithSpatialActionExpertModel(
             suffix_output = None
             
         elif inputs_embeds[0] is None and inputs_embeds[1] is None:
-            suffix_output = self.act_expert.forward(
+            suffix_output = self.action_expert.forward(
                 inputs_embeds=inputs_embeds[2],
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -228,14 +281,14 @@ class VLMWithSpatialActionExpertModel(
             middle_output = None
             suffix_output = suffix_output.last_hidden_state
         else:
-            models = [self.und_expert.language_model, self.gen_expert, self.act_expert]
-            num_layers = self.und_expert.config.text_config.num_hidden_layers
+            models = [self.reasoning_expert.language_model, self.spatial_expert, self.action_expert]
+            num_layers = self.reasoning_expert.config.text_config.num_hidden_layers
 
             # Check if gradient checkpointing is enabled for any of the models
             use_gradient_checkpointing = (
-                hasattr(self.act_expert, "gradient_checkpointing")
-                and self.gen_expert.gradient_checkpointing
-                and self.act_expert.gradient_checkpointing
+                hasattr(self.action_expert, "gradient_checkpointing")
+                and self.spatial_expert.gradient_checkpointing
+                and self.action_expert.gradient_checkpointing
                 and self.training
             ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
 
@@ -250,9 +303,9 @@ class VLMWithSpatialActionExpertModel(
                         position_ids,
                         use_reentrant=False,
                         preserve_rng_state=False,
-                        und_expert=self.und_expert,
-                        gen_expert=self.gen_expert, 
-                        act_expert=self.act_expert,
+                        reasoning_expert=self.reasoning_expert,
+                        spatial_expert=self.spatial_expert, 
+                        action_expert=self.action_expert,
                     )
                 else:
                     inputs_embeds = compute_layer_complete(
@@ -260,16 +313,16 @@ class VLMWithSpatialActionExpertModel(
                         inputs_embeds,
                         attention_mask,
                         position_ids,
-                        und_expert=self.und_expert,
-                        gen_expert=self.gen_expert, 
-                        act_expert=self.act_expert,
+                        reasoning_expert=self.reasoning_expert,
+                        spatial_expert=self.spatial_expert, 
+                        action_expert=self.action_expert,
                     )
 
             # final norm
             def compute_final_norms(inputs_embeds):
                 outputs_embeds = []
                 for i, hidden_states in enumerate(inputs_embeds):
-                    out_emb = models[i].norm(hidden_states)
+                    out_emb = models[i].model.norm(hidden_states)
                     outputs_embeds.append(out_emb)
                 return outputs_embeds
 
