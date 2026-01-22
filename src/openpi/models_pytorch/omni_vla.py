@@ -163,13 +163,13 @@ class OmniVLA(nn.Module):
         for param in self.reasoning_spatial_expert.vggt_encoder.parameters():
             param.requires_grad = False
 
-        # 冻结langugae
-        for param in self.reasoning_spatial_expert.reasoning_expert.language_model.parameters():
+        # 冻结VLM
+        for param in self.reasoning_spatial_expert.reasoning_expert.parameters():
             param.requires_grad = False
 
         # 冻结spatial
-        for param in self.reasoning_spatial_expert.spatial_expert.parameters():
-            param.requires_grad = False
+        # for param in self.reasoning_spatial_expert.spatial_expert.parameters():
+        #     param.requires_grad = False
 
         # msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
         # try:
@@ -607,6 +607,7 @@ class OmniVLA(nn.Module):
         # future_embs = self.get_cosmos_features(images[:, :, 2])
         # loss_gen = F.mse_loss(pred_cosmos_features[img_masks], future_embs.to(dtype=torch.float32)[img_masks])
 
+        # 步长36临时设定，后续可改为动态配置
         suffix_out = suffix_out[:, -36 :]
         suffix_out = suffix_out.to(dtype=torch.float32)
 

@@ -201,7 +201,9 @@ class Aggregator(nn.Module):
         images = (images - self._resnet_mean) / self._resnet_std
 
         # Reshape to [B*S, C, H, W] for patch embedding
-        images = images.view(B * S, C_in, H, W)
+        # images = images.view(B * S, C_in, H, W)
+        images = images.contiguous().view(B * S, C_in, H, W)
+        # add by yan
         patch_tokens = self.patch_embed(images)
 
         if isinstance(patch_tokens, dict):

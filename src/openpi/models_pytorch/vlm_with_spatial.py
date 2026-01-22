@@ -8,11 +8,17 @@ from transformers import PaliGemmaForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
+from safetensors.torch import load_file
+
 from openpi.vggt.models.vggt import VGGT
 from openpi.vlm_expert.dinov2_with_registers.modeling_dinov2_with_registers import Dinov2WithRegistersModel
 from openpi.vlm_expert.dinov2_with_registers.modular_dinov2_with_registers import Dinov2WithRegistersConfig
 
 import os
+
+MODEL_PATH = "/data/base_model/pi0_base_torch/model.safetensors"
+
+VGGT_PRETRAINED_PATH = "/data/base_model/VGGT-1B/model.safetensors"
 
 # Define the complete layer computation function for gradient checkpointing
 def compute_layer_complete(
@@ -159,6 +165,39 @@ class VLMWithSpatialActionExpertModel(
 
         self.reasoning_expert = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
 
+        # 2. 加载本地权重
+        state_dict = load_file(MODEL_PATH, device = "cpu")
+
+        # 全量搜索所有 key 中是否包含 VLM
+        vlm_keys = [k for k in state_dict.keys() if "paligemma_with_expert.paligemma" in k]
+
+        print(f"Found {len(vlm_keys)} keys for reasoning_expert:")
+        for k in vlm_keys:
+            print(k)
+
+        paligemma_state = {
+            k.replace("paligemma_with_expert.paligemma.", "", 1): v
+            for k, v in state_dict.items()
+            if k.startswith("paligemma_with_expert.paligemma.")
+        }
+
+        gemma_state = {
+            k.replace("paligemma_with_expert.gemma_expert.", "", 1): v
+            for k, v in state_dict.items()
+            if k.startswith("paligemma_with_expert.gemma_expert.")
+        }
+
+
+        missing_keys, unexpected_keys = self.reasoning_expert.load_state_dict(
+            paligemma_state,
+            strict=False    # 或 False，见下面说明
+        )
+
+        print(f"Loaded reasoning_expert: {len(paligemma_state)} params")
+        print("Missing keys (first 20):", missing_keys[:20])
+        print("Unexpected keys (first 20):", unexpected_keys[:20])
+
+
         "Spatial expert config"
         spatial_expert_config_hf = CONFIG_MAPPING["gemma"](
             head_dim=spatial_expert_config.head_dim,
@@ -173,10 +212,7 @@ class VLMWithSpatialActionExpertModel(
             # use_adarms=use_adarms[1],
             # adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
         )
-        # dino_config_path = spatial_expert_config.dino_path
-        # dino_config = Dinov2WithRegistersConfig.from_json_file(os.path.join(dino_config_path, "dino_config.json"))
-        # self.dino_encoder = Dinov2WithRegistersModel(dino_config)
-        # self.dino2llm = nn.Linear(self.dino_hidden_size, self.hidden_size) 
+        
 
         self.vggt_encoder = VGGT(enable_camera=False,
                                     enable_point=False,
@@ -184,6 +220,14 @@ class VLMWithSpatialActionExpertModel(
                                     enable_track=False,
                                     feature_only=True,
                                 )
+        state_dict_vggt = load_file(VGGT_PRETRAINED_PATH, device="cpu")
+        missing, unexpected = self.vggt_encoder.load_state_dict(
+            state_dict_vggt,
+            strict=False
+        )
+
+        print("VGGT missing:", missing)
+        print("VGGT unexpected:", unexpected)
         # self.spatial_projector = nn.Linear(768, spatial_expert_config_hf.width)
         self.spatial_expert = GemmaForCausalLM(config=spatial_expert_config_hf)
 
