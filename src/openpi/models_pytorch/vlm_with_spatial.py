@@ -293,9 +293,10 @@ class VLMWithSpatialActionExpertModel(
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
+                output_hidden_states=True,
             )
             past_key_values = prefix_output.past_key_values
-            prefix_output = prefix_output.last_hidden_state
+            prefix_output = prefix_output.hidden_states[-1]
             middle_output = None
             suffix_output = None
             
@@ -306,10 +307,11 @@ class VLMWithSpatialActionExpertModel(
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
+                output_hidden_states=True,
             )
             past_key_values = middle_output.past_key_values
             prefix_output = None
-            middle_output = middle_output.last_hidden_state
+            middle_output = middle_output.hidden_states[-1]
             suffix_output = None
             
         elif inputs_embeds[0] is None and inputs_embeds[1] is None:
@@ -319,11 +321,12 @@ class VLMWithSpatialActionExpertModel(
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
+                output_hidden_states=True,
             )
             past_key_values = None
             prefix_output = None
             middle_output = None
-            suffix_output = suffix_output.last_hidden_state
+            suffix_output = suffix_output.hidden_states[-1]
         else:
             models = [self.reasoning_expert.language_model, self.spatial_expert, self.action_expert]
             num_layers = self.reasoning_expert.config.text_config.num_hidden_layers

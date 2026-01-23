@@ -8,6 +8,7 @@ import torch
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F
+import torch._dynamo
 
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.g2vlm_pi0_pytorch import G2VLMWithActorExpertModel
@@ -168,8 +169,8 @@ class OmniVLA(nn.Module):
             param.requires_grad = False
 
         # 冻结spatial
-        # for param in self.reasoning_spatial_expert.spatial_expert.parameters():
-        #     param.requires_grad = False
+        for param in self.reasoning_spatial_expert.spatial_expert.parameters():
+            param.requires_grad = False
 
         # msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
         # try:
@@ -622,14 +623,74 @@ class OmniVLA(nn.Module):
         loss_action = F.mse_loss(u_t, v_t, reduction="none")
 
         return loss_action
+    
+    @torch.no_grad()
+    def sample_actions_old(self, device, observation, noise=None, num_steps=10) -> Tensor:
+        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+        bsize = observation.state.shape[0]
+        if noise is None:
+            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
+            noise = self.sample_noise(actions_shape, device)
 
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        middle_embs, middle_pad_masks, middle_att_masks = self.embed_spatial(
+            images, img_masks,  
+        )
+
+        pad_masks = torch.cat([prefix_pad_masks, middle_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, middle_att_masks], dim=1)
+        
+
+
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        max_prefix_position_ids = prefix_position_ids.max(dim=-1, keepdim=True).values
+
+        # Compute image and language key value cache
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.reasoning_spatial_expert.reasoning_expert.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        _, past_key_values = self.reasoning_spatial_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None, None],
+            use_cache=True,
+        )
+
+        dt = -1.0 / num_steps
+        dt = torch.tensor(dt, dtype=torch.float32, device=device)
+
+        x_t = noise
+        time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        while time >= -dt / 2:
+            expanded_time = time.expand(bsize)
+            v_t = self.denoise_step(
+                state,
+                prefix_pad_masks,
+                past_key_values,
+                max_prefix_position_ids=None, 
+                x_t = x_t,
+                timestep=expanded_time,
+            )
+
+            # Euler step - use new tensor assignment instead of in-place operation
+            x_t = x_t + dt * v_t
+            time += dt
+        return x_t
+
+    @torch._dynamo.disable
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
-    def sample_actions(
-        self, images, img_masks, pixel_values, image_grid_thw, lang_tokens, lang_masks, state, noise=None, num_steps=None, decode_image=False
-    ) -> Tensor:
+    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
         """Do a full inference forward and compute the action."""
         if num_steps is None:
             num_steps = self.config.num_inference_steps
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
         bsize = state.shape[0]
         device = state.device
@@ -639,19 +700,21 @@ class OmniVLA(nn.Module):
             # Sample noise with padded dimension as expected by action_in_proj
             actions_shape = (
                 bsize,
-                self.config.chunk_size,
-                self.config.max_action_dim,
+                32,
+                1024,
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
 
+        self.reasoning_spatial_expert.reasoning_expert.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            pixel_values, image_grid_thw, lang_tokens, lang_masks
+            images, img_masks, lang_tokens, lang_masks
         )
+
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids, rope_deltas = self.get_position_ids(lang_tokens, image_grid_thw, prefix_pad_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.reasoning_spatial_expert.und_expert.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
         _, past_key_values = self.reasoning_spatial_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
@@ -662,8 +725,8 @@ class OmniVLA(nn.Module):
         )
         max_prefix_position_ids = prefix_position_ids.max(dim=-1, keepdim=True).values
 
-        middle_embs, middle_pad_masks, middle_att_masks = self.embed_middle(
-            images[:, :, :2], img_masks, 
+        middle_embs, middle_pad_masks, middle_att_masks = self.embed_spatial(
+            images, img_masks,  
         )
 
         middle_len = middle_pad_masks.shape[1]
@@ -673,10 +736,15 @@ class OmniVLA(nn.Module):
         middle_att_2d_masks = make_att_2d_masks(middle_pad_masks, middle_att_masks)
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, middle_att_2d_masks], dim=2)
 
+        # 3. 确保它匹配 batch size
         middle_position_ids = torch.arange(1, middle_len + 1).repeat(3, 1, 1).to(max_prefix_position_ids) + max_prefix_position_ids
 
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.reasoning_spatial_expert.gen_expert.config._attn_implementation = "eager"  # noqa: SLF001
+        self.reasoning_spatial_expert.spatial_expert.config._attn_implementation = "eager"  # noqa: SLF001
+
+        print(f"DEBUG: past_key_values length: {past_key_values[0][0].shape[2]}")
+        print(f"DEBUG: middle_embs length: {middle_embs.shape[1]}")
+        print(f"DEBUG: middle_position_ids max: {middle_position_ids.max().item()}")
 
         (_, middle_out, _), past_key_values = self.reasoning_spatial_expert.forward(
             attention_mask=full_att_2d_masks_4d,
@@ -702,21 +770,21 @@ class OmniVLA(nn.Module):
                 past_key_values,
                 max_position_ids, 
                 x_t.to(dtype),
-                expanded_time.to(dtype),
+                timestep=expanded_time.to(dtype),
             )
             x_t = x_t + dt * v_t
             time += dt
 
-        if decode_image:
-            def cosmos_out_func(middle_out):
-                return self.decode_cosmos(middle_out)
-            pred_cosmos_features = self._apply_checkpoint(cosmos_out_func, middle_out.to(dtype=torch.bfloat16))
-            pred_cosmos_features = pred_cosmos_features.squeeze(0)
-            recon_images = self.cosmos.decode(pred_cosmos_features.squeeze(0))
-        else:
-            recon_images = None
+        # if decode_image:
+        #     def cosmos_out_func(middle_out):
+        #         return self.decode_cosmos(middle_out)
+        #     pred_cosmos_features = self._apply_checkpoint(cosmos_out_func, middle_out.to(dtype=torch.bfloat16))
+        #     pred_cosmos_features = pred_cosmos_features.squeeze(0)
+        #     recon_images = self.cosmos.decode(pred_cosmos_features.squeeze(0))
+        # else:
+        #     recon_images = None
 
-        return x_t, recon_images
+        return x_t
 
     def denoise_step(
         self,
@@ -743,6 +811,8 @@ class OmniVLA(nn.Module):
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         self.reasoning_spatial_expert.act_expert.config._attn_implementation = "eager"  # noqa: SLF001
 
+
+
         outputs_embeds, _ = self.reasoning_spatial_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
@@ -752,6 +822,6 @@ class OmniVLA(nn.Module):
         )
 
         suffix_out = outputs_embeds[2]
-        suffix_out = suffix_out[:, -self.config.chunk_size :]
+        suffix_out = suffix_out[:, -32 :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         return self.action_out_proj(suffix_out)

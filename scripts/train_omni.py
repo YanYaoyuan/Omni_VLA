@@ -643,6 +643,11 @@ def train_loop(config: _config.TrainConfig):
     enable_gradient_checkpointing = False
     model.gradient_checkpointing_disable()
 
+    for n, p in model.named_parameters():
+        if p.requires_grad:
+            print(n)
+
+
     # if hasattr(model, "gradient_checkpointing_enable"):
     #     enable_gradient_checkpointing = True
     #     model.gradient_checkpointing_enable()
@@ -680,15 +685,20 @@ def train_loop(config: _config.TrainConfig):
     # if g2vlm_weight_path is provided in the config
 
     # Optimizer + learning rate schedule from config
-    omni_warmup_steps = 1_000
-    omni_peak_lr = 5e-5
-    omni_decay_steps = 1_000_000
-    omni_decay_lr = 5e-5
+    # omni_warmup_steps = 1_000
+    # omni_peak_lr = 5e-5
+    # omni_decay_steps = 1_000_000
+    # omni_decay_lr = 5e-5
 
-    warmup_steps = omni_warmup_steps
-    peak_lr = omni_peak_lr
-    decay_steps = omni_decay_steps
-    end_lr = omni_decay_lr
+    # warmup_steps = omni_warmup_steps
+    # peak_lr = omni_peak_lr
+    # decay_steps = omni_decay_steps
+    # end_lr = omni_decay_lr
+
+    warmup_steps = config.lr_schedule.warmup_steps
+    peak_lr = config.lr_schedule.peak_lr
+    decay_steps = config.lr_schedule.decay_steps
+    end_lr = config.lr_schedule.decay_lr
 
     # Create optimizer with config parameters
     optim = torch.optim.AdamW(
@@ -717,6 +727,13 @@ def train_loop(config: _config.TrainConfig):
         return end_lr + (peak_lr - end_lr) * cos
 
     model.train()
+
+    print("Trainable parameters:")
+
+    for n, p in model.named_parameters():
+        if p.requires_grad:
+            print(n)
+
     start_time = time.time()
     infos = []  # Collect stats over log interval
     if is_main:

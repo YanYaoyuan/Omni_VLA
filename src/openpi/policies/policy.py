@@ -91,7 +91,7 @@ class Policy(BasePolicy):
         start_time = time.monotonic()
         outputs = {
             "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+            "actions": self._sample_actions(self._model, device = sample_rng_or_pytorch_device, observation = observation, **sample_kwargs),
         }
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
