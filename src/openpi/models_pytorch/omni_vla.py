@@ -479,20 +479,21 @@ class OmniVLA(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def get_position_ids(self, lang_tokens, image_grid_thw, pad_masks): 
-        L = lang_tokens.shape[1]
-        pseudo_avail_token_id = 777
-        padded_lang_tokens = torch.ones_like(pad_masks).to(lang_tokens) * pseudo_avail_token_id
-        padded_lang_tokens[:, :L] = lang_tokens
-        attention_mask = pad_masks.to(lang_tokens)
-        if image_grid_thw is not None:
-            image_grid_thw = image_grid_thw.view(-1, 3)
-        position_ids, rope_deltas = self.reasoning_spatial_expert.und_expert.model.get_rope_index(
-            padded_lang_tokens, 
-            image_grid_thw, 
-            attention_mask=attention_mask, 
-        )
-        return position_ids, rope_deltas
+    def get_position_ids(self, pad_masks):
+        # pad_masks: [batch_size, total_seq_len] 
+        # 这里的 total_seq_len = prefix + middle + suffix 的总和
+        
+        device = pad_masks.device
+        seq_len = pad_masks.shape[1]
+        
+        # 官方 PaliGemma 逻辑：不管你是图片还是文字，通通按顺序排队
+        # 生成 0, 1, 2, ..., total_seq_len - 1
+        position_ids = torch.arange(seq_len, dtype=torch.long, device=device)
+        position_ids = position_ids.unsqueeze(0).expand_as(pad_masks)
+        
+        # 注意：如果 pad_masks 包含 padding，这里也不用特意去填 0
+        # 因为 RoPE 会为每个位置生成旋转，而真正的“屏蔽”是靠 Attention Mask 实现的
+        return position_ids
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
@@ -582,7 +583,7 @@ class OmniVLA(nn.Module):
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         # position_ids, rope_deltas = self.get_position_ids(lang_tokens, image_grid_thw, pad_masks)
         # 先用PI0
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        position_ids = self.get_position_ids(pad_masks)
 
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 

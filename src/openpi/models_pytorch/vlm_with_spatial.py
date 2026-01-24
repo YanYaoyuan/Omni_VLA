@@ -62,31 +62,33 @@ def compute_layer_complete(
     query_states = torch.cat(query_states, dim=2)
     key_states = torch.cat(key_states, dim=2)
     value_states = torch.cat(value_states, dim=2)
+    
+    cos, sin = reasoning_expert.language_model.model.rotary_emb(query_states, position_ids)
 
-    seq_len = query_states.shape[2]
+    # seq_len = query_states.shape[2]
 
-    # 如何生成1650长度？？？
-    max_rotary_len = 1635
-    query_states = query_states[:, :, :max_rotary_len, :]
-    key_states   = key_states[:, :, :max_rotary_len, :]
-    value_states = value_states[:, :, :max_rotary_len, :]
-    seq_len = query_states.shape[2]
+    # # 如何生成1650长度？？？
+    # max_rotary_len = 1635
+    # query_states = query_states[:, :, :max_rotary_len, :]
+    # key_states   = key_states[:, :, :max_rotary_len, :]
+    # value_states = value_states[:, :, :max_rotary_len, :]
+    # seq_len = query_states.shape[2]
 
-    dummy_tensor = torch.zeros(
-        query_states.shape[0],
-        seq_len,
-        query_states.shape[-1],
-        device=query_states.device,
-        dtype=query_states.dtype,
-    )
+    # dummy_tensor = torch.zeros(
+    #     query_states.shape[0],
+    #     seq_len,
+    #     query_states.shape[-1],
+    #     device=query_states.device,
+    #     dtype=query_states.dtype,
+    # )
 
 
-    cos, sin = reasoning_expert.language_model.model.rotary_emb(dummy_tensor, position_ids)
+    # cos, sin = reasoning_expert.language_model.model.rotary_emb(dummy_tensor, position_ids)
     # cos, sin = reasoning_expert.get_rotary_embedding(seq_len)
 
     # ⚠ 确保长度对齐 Q/K
-    cos = cos[:, :seq_len, :]
-    sin = sin[:, :seq_len, :]
+    # cos = cos[:, :seq_len, :]
+    # sin = sin[:, :seq_len, :]
     
     query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
         query_states, key_states, cos, sin, unsqueeze_dim=1
