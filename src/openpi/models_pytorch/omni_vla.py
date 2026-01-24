@@ -373,7 +373,9 @@ class OmniVLA(nn.Module):
         return img_emb, pad_masks, att_masks
     
     def embed_spatial(self, images, img_masks):
-        """Embed spatial images，输出与 embed_prefix 完全兼容"""
+        """
+        Embed spatial images，确保 Mask 长度与 VGGT 输出的 Token 数量严格对齐。
+        """
         # 1. 准备图像张量 [B, S, C, H, W]
         images_tensor = torch.stack(images, dim=1)
         images_tensor = images_tensor.to(
@@ -381,38 +383,49 @@ class OmniVLA(nn.Module):
         )
         B, S, C, H, W = images_tensor.shape
 
-        # 2. 修复 Mask 处理逻辑
-        if isinstance(img_masks, list):
-            mask_tensor = torch.stack(img_masks, dim=1).to(images_tensor.device)  # [B, S]
-        else:
-            mask_tensor = img_masks.to(images_tensor.device)
-
-        # 扩展到 [B, S, H, W]
-        full_spatial_masks = mask_tensor.unsqueeze(-1).unsqueeze(-1).expand(B, S, H, W)
-
-        # 3. 下采样到 Patch 级别 (Patch Size = 14)
-        gh, gw = H // 14, W // 14
-        flat_masks = full_spatial_masks.reshape(B * S, 1, H, W).float()
-        down_masks = torch.nn.functional.interpolate(flat_masks, size=(gh, gw), mode='nearest')
-        pad_masks = down_masks.view(B, S * gh * gw).to(torch.bool)
-
-        # 4. VGGT 特征提取
+        # 2. VGGT 特征提取
         def image_embed_func(img):
-            # 输入 [B, S, C, H, W]，返回 [B, S, num_tokens, emb_dim]
+            # 输入 [B, S, C, H, W]，返回字典，其中 features[-1] 是最后一层特征
+            # 形状通常为 [B, S, N, D]，其中 N 是 token 数量（含 patch + global tokens）
             res = self.reasoning_spatial_expert.vggt_encoder(img)
-            return res["features"][-1]  # [B, S, num_tokens, emb_dim]
+            return res["features"][-1]
 
         img_emb = self._apply_checkpoint(image_embed_func, images_tensor)  # [B, S, N, D]
-
-        # 5. Flatten 序列到 [B, seq_len, emb_dim]
+        
+        # 获取实际的 Token 数量 N
         B, S, N, D = img_emb.shape
-        img_emb = img_emb.view(B, S * N, D)  # [B, S*N, D]
+        device = img_emb.device
 
-        # 6. 构建 attention mask，全 attention
-        att_masks = torch.zeros_like(pad_masks, dtype=torch.bool)  # [B, S*N]
+        # 3. 动态构建 Mask
+        # 逻辑：VGGT 输出的 N 个 token 中，前一部分通常是 Patch，后一部分是 Global
+        # 为了严谨，我们直接根据 img_emb 的实际形状 [B, S*N] 生成全 1 的 Mask
+        # 如果后续需要对图像区域做精细化 Padding，建议在此处根据 N 的构成进行切片处理
+        
+        # 生成与 img_emb 长度完全一致的 pad_masks [B, S*N]
+        # 我们先生成 [B, S, N] 再 view 成 [B, S*N] 以保持维度语义清晰
+        pad_masks = torch.ones((B, S, N), dtype=torch.bool, device=device)
+        
+        # 如果原始 img_masks (针对图片的 batch padding) 需要生效：
+        if img_masks is not None:
+            if isinstance(img_masks, list):
+                mask_tensor = torch.stack(img_masks, dim=1).to(device)  # [B, S]
+            else:
+                mask_tensor = img_masks.to(device)
+                
+            # 将 [B, S] 的图像级 mask 广播到 [B, S, N]
+            # 这意味着如果某张图片是 padding 的，那么它对应的所有 N 个 token 都会被 mask
+            pad_masks = pad_masks * mask_tensor.unsqueeze(-1)
 
-        img_emb = self.spatial_to_reasoning(img_emb)  # [B, seq_len, 1024]
+        # 4. Flatten 序列到 [B, S*N, D]
+        img_emb = img_emb.view(B, S * N, D)
+        pad_masks = pad_masks.view(B, S * N)
+        
+        # 5. 构建 attention mask (Gemma 风格通常 0 表示不屏蔽，具体看 make_att_2d_masks 实现)
+        # 这里保持与你原始代码逻辑一致，全 0
+        att_masks = torch.zeros_like(pad_masks, dtype=torch.bool)
 
+        # 6. 维度映射到推理模型维度 (如 1024 或 2048)
+        img_emb = self.spatial_to_reasoning(img_emb)
 
         return img_emb, pad_masks, att_masks
 
