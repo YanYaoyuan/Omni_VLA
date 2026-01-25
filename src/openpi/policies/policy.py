@@ -88,10 +88,24 @@ class Policy(BasePolicy):
             sample_kwargs["noise"] = noise
 
         observation = _model.Observation.from_dict(inputs)
+        obs_object = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
+        # 在调用前把重复的参数 pop 掉
+        # if "device" in sample_kwargs:
+        sample_kwargs.pop("observation", None)
+        sample_kwargs.pop("device", None)
+        sample_kwargs.pop("model", None) # 以防万一
+        # outputs = {
+        #     "state": inputs["state"],
+        #     "actions": self._sample_actions(self._model, device = sample_rng_or_pytorch_device, observation = observation, **sample_kwargs),
+        # }
         outputs = {
             "state": inputs["state"],
-            "actions": self._sample_actions(self._model, device = sample_rng_or_pytorch_device, observation = observation, **sample_kwargs),
+            "actions": self._sample_actions(
+                observation=obs_object,
+                device=sample_rng_or_pytorch_device,
+                **sample_kwargs
+            ),
         }
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
