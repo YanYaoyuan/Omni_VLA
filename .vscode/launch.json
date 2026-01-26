@@ -38,7 +38,9 @@
       "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.9",
       "CUDA_VISIBLE_DEVICES": "1",
       "TF_CPP_MIN_LOG_LEVEL": "0",
-      "TF_ENABLE_ONEDNN_OPTS": "0"
+      "TF_ENABLE_ONEDNN_OPTS": "0",
+      "TORCHDYNAMO_DISABLE": "1"
+
     },
     "console": "integratedTerminal",
     "justMyCode": false,

@@ -21,6 +21,7 @@ from openpi.models.pi0_config import Pi0Config
 from openpi.models_pytorch.omni_config import OmniConfig
 from transformers.cache_utils import DynamicCache
 from einops import rearrange
+import copy
 
 from ..data_vlm.data_utils import get_rope_index_image_3D
 from ..data_vlm.data_utils import get_rope_index_image_3D_dino
@@ -36,6 +37,21 @@ OBS_LANGUAGE_TOKENS = OBS_LANGUAGE + ".tokens"
 OBS_LANGUAGE_ATTENTION_MASK = OBS_LANGUAGE + ".attention_mask"
 
 ACTION = "action"
+
+def _debug_tensor(name, x, max_print=5):
+    if x is None:
+        print(f"{name}: None")
+        return
+    print(
+        f"{name}: "
+        f"shape={tuple(x.shape)}, "
+        f"dtype={x.dtype}, "
+        f"device={x.device}"
+    )
+    # 只打印前面一點點，避免刷屏
+    print(f"{name} sample:", x.flatten()[:max_print].tolist())
+    print("-" * 60)
+
 
 def pad_vector(vector, new_dim):
     """Pad the last dimension of a vector to new_dim with zeros.
@@ -128,6 +144,9 @@ class OmniVLA(nn.Module):
         """
         super().__init__()
         self.config = config
+
+        self.action_horizon = config.action_horizon
+
         spatial_config = _gemma.get_config(config.spatial_expert_variant)
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -143,7 +162,7 @@ class OmniVLA(nn.Module):
         self.spatial_to_reasoning = torch.nn.Linear(2048, 1024, dtype=dtype)
 
 
-
+        # export TORCHDYNAMO_DISABLE=1
 
 
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
@@ -169,8 +188,8 @@ class OmniVLA(nn.Module):
             param.requires_grad = False
 
         # 冻结spatial
-        for param in self.reasoning_spatial_expert.spatial_expert.parameters():
-            param.requires_grad = False
+        # for param in self.reasoning_spatial_expert.spatial_expert.parameters():
+        #     param.requires_grad = False
 
         # msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
         # try:
@@ -483,7 +502,7 @@ class OmniVLA(nn.Module):
         pad_masks.append(action_time_mask)
 
         # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] + ([0] * (self.config.action_horizon - 1))
+        att_masks += [1] + ([0] * (self.action_horizon - 1))
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -507,18 +526,6 @@ class OmniVLA(nn.Module):
         # 注意：如果 pad_masks 包含 padding，这里也不用特意去填 0
         # 因为 RoPE 会为每个位置生成旋转，而真正的“屏蔽”是靠 Attention Mask 实现的
         return position_ids
-
-    def get_inference_position_ids(self, batch_size, prefix_len, middle_len, suffix_len, device):
-        total_len = prefix_len + middle_len + suffix_len
-        # 这里的逻辑和训练时的 get_position_ids(pad_masks) 物理本质是一样的
-        # 生成 [0, 1, 2, ..., total_len - 1]
-        full_ids = torch.arange(total_len, device=device).unsqueeze(0).expand(batch_size, -1)
-        
-        # 切片给不同的部分
-        p_ids = full_ids[:, :prefix_len]
-        m_ids = full_ids[:, prefix_len : prefix_len + middle_len]
-        s_ids = full_ids[:, prefix_len + middle_len :]
-        return p_ids, m_ids, s_ids
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
@@ -625,19 +632,11 @@ class OmniVLA(nn.Module):
             forward_func, prefix_embs, middle_embs, suffix_embs, att_2d_masks_4d, position_ids
         )
 
-        # def cosmos_out_func(middle_out):
-        #     return self.decode_cosmos(middle_out)
-        
-        # pred_cosmos_features = self._apply_checkpoint(cosmos_out_func, middle_out.to(dtype=torch.float32))
-
-        # future_embs = self.get_cosmos_features(images[:, :, 2])
-        # loss_gen = F.mse_loss(pred_cosmos_features[img_masks], future_embs.to(dtype=torch.float32)[img_masks])
-
         # 步长36临时设定，后续可改为动态配置
-        suffix_out = suffix_out[:, -36 :]
+        suffix_out = suffix_out[:, -self.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
 
-        u_t = u_t[:, -36 :]
+        u_t = u_t[:, -self.action_horizon :]
 
 
         def action_out_proj_func(suffix_out):
@@ -649,65 +648,6 @@ class OmniVLA(nn.Module):
 
         return loss_action
     
-    @torch.no_grad()
-    def sample_actions_old(self, device, observation, noise=None, num_steps=10) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
-        bsize = observation.state.shape[0]
-        if noise is None:
-            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
-            noise = self.sample_noise(actions_shape, device)
-
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
-
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
-        )
-        middle_embs, middle_pad_masks, middle_att_masks = self.embed_spatial(
-            images, img_masks,  
-        )
-
-        pad_masks = torch.cat([prefix_pad_masks, middle_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, middle_att_masks], dim=1)
-        
-
-
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-
-        max_prefix_position_ids = prefix_position_ids.max(dim=-1, keepdim=True).values
-
-        # Compute image and language key value cache
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.reasoning_spatial_expert.reasoning_expert.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        _, past_key_values = self.reasoning_spatial_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None, None],
-            use_cache=True,
-        )
-
-        dt = -1.0 / num_steps
-        dt = torch.tensor(dt, dtype=torch.float32, device=device)
-
-        x_t = noise
-        time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        while time >= -dt / 2:
-            expanded_time = time.expand(bsize)
-            v_t = self.denoise_step(
-                state,
-                prefix_pad_masks,
-                past_key_values,
-                suffix_position_ids=None,
-                x_t=x_t,
-                timestep=expanded_time,
-            )
-
-            # Euler step - use new tensor assignment instead of in-place operation
-            x_t = x_t + dt * v_t
-            time += dt
-        return x_t
 
     @torch._dynamo.disable
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
@@ -726,7 +666,7 @@ class OmniVLA(nn.Module):
             # Sample noise with padded dimension as expected by action_in_proj
             actions_shape = (
                 bsize,
-                10,
+                self.action_horizon,
                 32,
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
@@ -735,68 +675,60 @@ class OmniVLA(nn.Module):
 
         # 获取各部分的 pad_masks (推理阶段一般全是 1，除非有特殊的 padding)
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        middle_embs, middle_pad_masks, middle_att_masks = self.embed_spatial(images, img_masks)
-        
-        # 假设我们知道 suffix (action) 的长度，比如训练时是 36
-        action_horizon = noise.shape[1]      # 10
-        suffix_len = action_horizon + 1      # +1 for state token
-
-        suffix_pad_masks = torch.ones((bsize, suffix_len), device=device, dtype=prefix_pad_masks.dtype)
-
-        # 1. 【核心：完全对齐训练】构造总的 pad_masks
-        # 这和你训练 forward 里的拼接逻辑一模一样
-        full_pad_masks = torch.cat([prefix_pad_masks, middle_pad_masks, suffix_pad_masks], dim=1)
-        
-        # 2. 直接调用训练时的函数获取全局 ID
-        full_position_ids = self.get_position_ids(full_pad_masks)
-
-        # 3. 按长度切分出各阶段需要的 ID
-        prefix_len = prefix_embs.shape[1]
-        middle_len = middle_embs.shape[1]
-        
-        p_ids = full_position_ids[:, :prefix_len]
-        m_ids = full_position_ids[:, prefix_len : prefix_len + middle_len]
-        s_ids = full_position_ids[:, prefix_len + middle_len :]
-
-        # --- 阶段 A: Forward Prefix (第一阶段存入 KV Cache) ---
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        predix_position_ids = self.get_position_ids(prefix_pad_masks)
+
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
 
+        self.reasoning_spatial_expert.reasoning_expert.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        
         _, past_key_values = self.reasoning_spatial_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
-            position_ids=p_ids,
+            position_ids=predix_position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None, None],
             use_cache=True,
         )
+        middle_embs, middle_pad_masks, middle_att_masks = self.embed_spatial(
+            images, img_masks, 
+        )
 
-        # --- 阶段 B: Forward Middle (第二阶段衔接 KV Cache) ---
-        # 构造让 middle 能看到 prefix 的 2D Mask
-        prefix_to_middle_mask = prefix_pad_masks[:, None, :].expand(bsize, middle_len, prefix_len)
-        middle_self_mask = make_att_2d_masks(middle_pad_masks, middle_att_masks)
-        full_middle_att_mask = torch.cat([prefix_to_middle_mask, middle_self_mask], dim=2)
-        full_middle_att_mask_4d = self._prepare_attention_masks_4d(full_middle_att_mask)
+        middle_len = middle_pad_masks.shape[1]
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, middle_len, prefix_len)
+        middle_att_2d_masks = make_att_2d_masks(middle_pad_masks, middle_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, middle_att_2d_masks], dim=2)
 
-        # 切换到 spatial_expert 视角计算
-        self.reasoning_spatial_expert.spatial_expert.config._attn_implementation = "eager"
+        # middle_position_ids = torch.arange(1, middle_len + 1).repeat(3, 1, 1).to(max_prefix_position_ids) + max_prefix_position_ids
+        middle_position_ids = (
+            torch.arange(
+                prefix_len,
+                prefix_len + middle_len,
+                device=device,
+                dtype=torch.long
+            )
+            .unsqueeze(0)
+            .expand(batch_size, middle_len)
+        )
+
+        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+
+        self.reasoning_spatial_expert.spatial_expert.config._attn_implementation = "eager"  # noqa: SLF001
+
         (_, middle_out, _), past_key_values = self.reasoning_spatial_expert.forward(
-            attention_mask=full_middle_att_mask_4d,
-            position_ids=m_ids,
+            attention_mask=full_att_2d_masks_4d,
+            position_ids=middle_position_ids,
             past_key_values=past_key_values,
             inputs_embeds=[None, middle_embs, None],
             use_cache=True,
         )
 
-        # --- 阶段 C: Diffusion Denoising Loop (第三阶段反复迭代) ---
-        # 此时全量 Mask 已经包含前两部分
+        max_position_ids = middle_position_ids.max(dim=-1, keepdim=True).values
         curr_pad_masks = torch.cat([prefix_pad_masks, middle_pad_masks], dim=1)
 
-        # 记录初始长度（这就是你的图像+文本的前缀长度，日志显示是 1679）
-        initial_kv_len = past_key_values[0][0].shape[-2]
-
-        # 【关键：将原始 Tuple 转换为 DynamicCache 对象】
-        # 这样模型在 forward 时就能正确调用 .get_seq_length()
-        base_cache = DynamicCache.from_legacy_cache(past_key_values)
+        action_horizon = self.action_horizon   
+        suffix_len = action_horizon + 1      # +1 for state token
 
         # 【修改点】显式指定 dtype 避开 double
         target_dtype = self.action_in_proj.weight.dtype
@@ -808,55 +740,27 @@ class OmniVLA(nn.Module):
 
         step_count = 0
 
-        base_past_key_values = past_key_values
+        # 保存原始 past_key_values 的深拷贝，用于每次迭代
+        base_past_key_values = copy.deepcopy(past_key_values)
 
 
         while time >= -dt / 2:
             expanded_time = time.expand(bsize).to(target_dtype)
-
-
-            base_cache.crop(initial_kv_len)
-
-            print(f"\n[DEBUG] Loop Step: KV length reset to {base_cache.get_seq_length()}")
-
-            # --- 关键监控打印 ---
-            if step_count < 5:
-                print(f"\n===== DIFF STEP {step_count} =====")
-                print("x_t shape:", x_t.shape)
-                print("curr_pad_masks shape:", curr_pad_masks.shape)
-                print("suffix_position_ids shape:", s_ids.shape)
-                print("suffix_position_ids max:", s_ids.max().item())
-                print("suffix_position_ids min:", s_ids.min().item())
-
-                # KV cache 长度
-                kv_len = base_past_key_values[0][0].shape[-2]
-                print("KV cache len:", kv_len)
-            # 注意：s_ids 始终固定在序列末尾 [L-36 : L]
+            # 注意：每次迭代都使用 base_past_key_values 的深拷贝，避免 past_key_values 被修改
+            # 因为即使 use_cache=False，transformers 的 forward 可能仍会就地修改传入的 past_key_values
             v_t = self.denoise_step(
                 state,
-                past_key_values,
-                base_cache,
-                s_ids, # 传入预先算好的绝对位置 ID
-                x_t,
+                curr_pad_masks,
+                copy.deepcopy(base_past_key_values),  # 每次迭代都创建新的深拷贝
+                suffix_position_ids = max_position_ids, 
+                x_t=x_t,
                 timestep=expanded_time,
             )
-            # 监控 v_t 的维度
-            if step_count < 2:
-                print(f"DEBUG Loop: v_t shape: {v_t.shape}")
-
-            # 4. 再次检查，看 denoise_step 执行完后，原始地址里的长度变了吗
-            post_kv_len = base_past_key_values[0][0].shape[-2]
-            if post_kv_len > initial_kv_len:
-                print(f"  ⚠️ 检测到污染！KV 长度从 {initial_kv_len} 被拉长到了 {post_kv_len}")
             
             x_t = x_t + dt * v_t
             time += dt
             time = time.to(target_dtype)
             step_count += 1
-
-            print("KV len:", base_past_key_values[0][0].shape[-2])
-
-
 
         return x_t
 
@@ -870,6 +774,10 @@ class OmniVLA(nn.Module):
             x_t,
             timestep,
         ):
+
+        # assert past_key_values[0][0].shape[2] == prefix_pad_masks.shape[1], \
+        #     f"KV polluted! got {past_key_values[0][0].shape[2]}, expected {prefix_pad_masks.shape[1]}"
+
         print("\n--- ENTER denoise_step ---")
         print("x_t:", x_t.shape)
         print("timestep:", timestep.shape, timestep[0].item())
@@ -902,6 +810,16 @@ class OmniVLA(nn.Module):
         batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1] # 这里的 prefix_len 实际上是 (prefix + middle) 的总长
 
+        suffix_len = suffix_pad_masks.shape[1]
+
+        actual_position_ids = (
+            torch.arange(1, suffix_len + 1, device=suffix_embs.device)
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+            + suffix_position_ids  # 这里的 suffix_position_ids 是前一阶段的 max_id
+        )
+
+
         # 2. 构造 2D Attention Mask
         # 让 Suffix 能看到前面的所有缓存内容 (Prefix + Middle)
         prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
@@ -913,23 +831,43 @@ class OmniVLA(nn.Module):
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         print("full_att_2d_masks_4d:", full_att_2d_masks_4d.shape)
 
+        #cposition_ids = torch.arange(1, suffix_len + 1).repeat(3, 1, 1).to(suffix_position_ids) + suffix_position_ids
+
+
 
         # 3. 配置模型环境
         self.reasoning_spatial_expert.action_expert.config._attn_implementation = "eager"
 
-        print("\n>>> BEFORE action_expert.forward")
-        print("past_key_values len:", past_key_values[0][0].shape[-2])
-        print("position_ids shape:", suffix_position_ids.shape)
-        print("position_ids max:", suffix_position_ids.max().item())
-        print("attention_mask last dim:", full_att_2d_masks_4d.shape[-1])
-        print("expected total len:", past_key_values[0][0].shape[-2] + suffix_embs.shape[1])
+        print("===== reasoning_spatial_expert.forward input shapes =====")
+
+        print("attention_mask:", 
+            None if full_att_2d_masks_4d is None else tuple(full_att_2d_masks_4d.shape))
+
+        print("position_ids:", 
+            None if actual_position_ids is None else tuple(actual_position_ids.shape))
+
+        if past_key_values is None:
+            print("past_key_values: None")
+        else:
+            print("past_key_values layers:", len(past_key_values))
+            k, v = past_key_values[0]
+            print("past_key_values[0].key:", tuple(k.shape))
+            print("past_key_values[0].value:", tuple(v.shape))
+
+        inputs_embeds = [None, None, suffix_embs]
+        for i, emb in enumerate(inputs_embeds):
+            print(f"inputs_embeds[{i}]:", 
+                None if emb is None else tuple(emb.shape))
+
+
+
 
 
         # 4. 执行 Forward
         # 注意：position_ids 现在直接使用传入的绝对物理 ID
         outputs_embeds, _ = self.reasoning_spatial_expert.forward(
             attention_mask=full_att_2d_masks_4d,
-            position_ids=suffix_position_ids, # 【核心修改】
+            position_ids=actual_position_ids, # 【核心修改】
             past_key_values=past_key_values,
             inputs_embeds=[None, None, suffix_embs],
             use_cache=False, 
@@ -941,8 +879,8 @@ class OmniVLA(nn.Module):
         suffix_out = outputs_embeds[2] 
         
         # config 或训练代码统一长度
-        action_horizon = x_t.shape[1] # 动态获取，通常是 50
-        suffix_out = suffix_out[:, -action_horizon:, :] # 提取后 50 个 token
+        # action_horizon = x_t.shape[1] # 动态获取，通常是 50
+        suffix_out = suffix_out[:, -self.action_horizon:, :] # 提取后 50 个 token
     
         suffix_out = suffix_out.to(dtype=target_dtype)
 
