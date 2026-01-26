@@ -332,64 +332,6 @@ class OmniVLA(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def get_cosmos_features(self, images):
-        shape = images.shape[:-3]
-        c, h, w = images.shape[-3:]
-        images = images.reshape(-1, c, h, w)
-        images = F.interpolate(images, size=(256, 256), mode="bilinear", align_corners=False)
-        images = images * 2 - 1  # [-1, 1]
-        features = self.cosmos.encode(images)
-        c, h, w = features.shape[-3:]
-        features = features.view(*shape, c, h, w)
-        return features
-
-    def embed_spatial_old(self, images, img_masks):
-        """Embed spatial images to prepare for Expert Gemma processing."""
-        # 1. 准备图像张量 [B, S, C, H, W]
-        images_tensor = torch.stack(images, dim=1)
-        images_tensor = images_tensor.to(dtype=next(self.reasoning_spatial_expert.vggt_encoder.parameters()).dtype)
-        B, S, C, H, W = images_tensor.shape
-
-        # 2. 修复 Mask 处理逻辑
-        # img_masks 现在是一个 list, 里面每个元素是 [B, S] 的 bool
-        # 我们需要的是 [B, S, H, W]
-        if isinstance(img_masks, list):
-            # 即使堆叠后也只是 [B, S]，没有 H, W 维度
-            mask_tensor = torch.stack(img_masks, dim=1).to(images_tensor.device) # [B, S]
-        else:
-            mask_tensor = img_masks.to(images_tensor.device)
-
-        # 重点：将 [B, S] 扩展到 [B, S, H, W]
-        # 使用 .unsqueeze(-1).unsqueeze(-1) 增加维度，然后用 .expand 填充空间
-        full_spatial_masks = mask_tensor.unsqueeze(-1).unsqueeze(-1).expand(B, S, H, W)
-
-        # 3. 接下来进行正常的下采样逻辑 (Patch Size = 14)
-        gh, gw = H // 14, W // 14
-        
-        # 将 [B, S, H, W] -> [B*S, 1, H, W]
-        flat_masks = full_spatial_masks.reshape(B * S, 1, H, W).float()
-        
-        # 下采样到 Patch 级别
-        down_masks = torch.nn.functional.interpolate(flat_masks, size=(gh, gw), mode='nearest')
-        
-        # 最终对齐到 Token 数量: [B, S * gh * gw]
-        pad_masks = down_masks.view(B, S * gh * gw).to(torch.bool)
-
-        # 4. VGGT 特征提取
-        def image_embed_func(img):
-            # 注意：这里传入的 img 是 [B, S, C, H, W]
-            res = self.reasoning_spatial_expert.vggt_encoder(img)
-            # 确保返回的是视觉 token 序列
-            return res["features"][-1] 
-
-        img_emb = self._apply_checkpoint(image_embed_func, images_tensor)
-        B_t, S_t, N_t, D_t = img_emb.shape
-        img_emb = img_emb.view(B_t, S_t * N_t, D_t) 
-        # 这里的 att_masks 通常和 pad_masks 一致
-
-        att_masks = torch.zeros_like(pad_masks, dtype=torch.bool)
-
-        return img_emb, pad_masks, att_masks
     
     def embed_spatial(self, images, img_masks):
         """
