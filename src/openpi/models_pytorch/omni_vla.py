@@ -170,11 +170,16 @@ class OmniVLA(nn.Module):
 
 
         self.state_proj = nn.Linear(32, action_expert_config.width)
-        self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
-        self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+        self.action_time_mlp_in = nn.Linear(
+            2 * action_expert_config.width, action_expert_config.width
+        )
+        self.action_time_mlp_out = nn.Linear(
+            action_expert_config.width, action_expert_config.width
+        )
 
+        # 推理阶段先保持逻辑正确，不再对 bound method 做 torch.compile 包装，
+        # 否则会导致绑定关系丢失（出现 “missing 1 required positional argument: 'self'” 报错）。
         torch.set_float32_matmul_precision("high")
-        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -592,238 +597,115 @@ class OmniVLA(nn.Module):
     
 
     @torch._dynamo.disable
-    @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
-    def sample_actions(self,  observation, device = None, noise=None, num_steps=10) -> Tensor:
-        
-        """Do a full inference forward and compute the action."""
+    @torch.no_grad()
+    def sample_actions(self, observation, device=None, noise=None, num_steps: int = 10) -> Tensor:
+        """
+        推理版采样：为了保证与训练前向完全一致，
+        每个去噪步骤都重新跑一遍 prefix + middle + suffix 的 MoT 前向（不使用 KV cache）。
+        这样虽然更慢，但可以先验证训练出来的模型在推理时是合理的。
+        """
         if num_steps is None:
             num_steps = self.config.num_inference_steps
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
+            observation, train=False
+        )
 
         bsize = state.shape[0]
         device = state.device
-        dtype = state.dtype
 
         if noise is None:
-            # Sample noise with padded dimension as expected by action_in_proj
-            actions_shape = (
-                bsize,
-                self.action_horizon,
-                32,
-            )  # Use config max_action_dim for internal processing
+            # 内部一直在 32 维动作空间做去噪，长度为 action_horizon
+            actions_shape = (bsize, self.action_horizon, 32)
             noise = self.sample_noise(actions_shape, device)
 
-        self.reasoning_spatial_expert.reasoning_expert.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        # 获取各部分的 pad_masks (推理阶段一般全是 1，除非有特殊的 padding)
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        predix_position_ids = self.get_position_ids(prefix_pad_masks)
-
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-
-        self.reasoning_spatial_expert.reasoning_expert.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-        
-        _, past_key_values = self.reasoning_spatial_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=predix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None, None],
-            use_cache=True,
-        )
-        middle_embs, middle_pad_masks, middle_att_masks = self.embed_spatial(
-            images, img_masks, 
-        )
-
-        middle_len = middle_pad_masks.shape[1]
-        batch_size = prefix_pad_masks.shape[0]
-        prefix_len = prefix_pad_masks.shape[1]
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, middle_len, prefix_len)
-        middle_att_2d_masks = make_att_2d_masks(middle_pad_masks, middle_att_masks)
-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, middle_att_2d_masks], dim=2)
-
-        # middle_position_ids = torch.arange(1, middle_len + 1).repeat(3, 1, 1).to(max_prefix_position_ids) + max_prefix_position_ids
-        middle_position_ids = (
-            torch.arange(
-                prefix_len,
-                prefix_len + middle_len,
-                device=device,
-                dtype=torch.long
-            )
-            .unsqueeze(0)
-            .expand(batch_size, middle_len)
-        )
-
-        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-
-        self.reasoning_spatial_expert.spatial_expert.config._attn_implementation = "eager"  # noqa: SLF001
-
-        (_, middle_out, _), past_key_values = self.reasoning_spatial_expert.forward(
-            attention_mask=full_att_2d_masks_4d,
-            position_ids=middle_position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=[None, middle_embs, None],
-            use_cache=True,
-        )
-
-        max_position_ids = middle_position_ids.max(dim=-1, keepdim=True).values
-        curr_pad_masks = torch.cat([prefix_pad_masks, middle_pad_masks], dim=1)
-
-        action_horizon = self.action_horizon   
-        suffix_len = action_horizon + 1      # +1 for state token
-
-        # 【修改点】显式指定 dtype 避开 double
         target_dtype = self.action_in_proj.weight.dtype
-        
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=target_dtype, device=device)
         x_t = noise.to(target_dtype)
         time = torch.tensor(1.0, dtype=target_dtype, device=device)
 
-        step_count = 0
-
-        # 保存原始 past_key_values 的深拷贝，用于每次迭代
-        base_past_key_values = copy.deepcopy(past_key_values)
-
+        # 三个 expert 都用 eager 实现，避免 flash-attn 等实现差异
+        self.reasoning_spatial_expert.reasoning_expert.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.reasoning_spatial_expert.spatial_expert.config._attn_implementation = "eager"  # noqa: SLF001
+        self.reasoning_spatial_expert.action_expert.config._attn_implementation = "eager"  # noqa: SLF001
 
         while time >= -dt / 2:
             expanded_time = time.expand(bsize).to(target_dtype)
-            # 注意：每次迭代都使用 base_past_key_values 的深拷贝，避免 past_key_values 被修改
-            # 因为即使 use_cache=False，transformers 的 forward 可能仍会就地修改传入的 past_key_values
             v_t = self.denoise_step(
-                state,
-                curr_pad_masks,
-                copy.deepcopy(base_past_key_values),  # 每次迭代都创建新的深拷贝
-                suffix_position_ids = max_position_ids, 
+                images=images,
+                img_masks=img_masks,
+                lang_tokens=lang_tokens,
+                lang_masks=lang_masks,
+                state=state,
                 x_t=x_t,
                 timestep=expanded_time,
             )
-            
             x_t = x_t + dt * v_t
-            time += dt
-            time = time.to(target_dtype)
-            step_count += 1
+            time = (time + dt).to(target_dtype)
 
         return x_t
 
-    
     def denoise_step(
-            self,
-            state,
-            prefix_pad_masks,   # 这是 prefix + middle 的合并 mask
-            past_key_values,
-            suffix_position_ids, # 【关键修改】直接传入预先算好的物理 ID
-            x_t,
-            timestep,
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        x_t,
+        timestep,
+    ):
+        """单步去噪：严格复用训练时的 MoT 计算路径。"""
+        # 1) 生成 prefix / middle / suffix 三段 embedding
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        middle_embs, middle_pad_masks, middle_att_masks = self.embed_spatial(
+            images, img_masks
+        )
+
+        # timestep: [B]，x_t: [B, H, 32]
+        # embed_suffix 里会自动把 state / x_t / timestep 拼成训练时一样的 suffix 序列
+        timestep = timestep.to(torch.float32)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
+            state, x_t, timestep
+        )
+
+        # 与训练阶段一致的 dtype 处理
+        if (
+            self.reasoning_spatial_expert.reasoning_expert.language_model.model.layers[
+                0
+            ].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
         ):
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+            middle_embs = middle_embs.to(dtype=torch.bfloat16)
+            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
 
-        # assert past_key_values[0][0].shape[2] == prefix_pad_masks.shape[1], \
-        #     f"KV polluted! got {past_key_values[0][0].shape[2]}, expected {prefix_pad_masks.shape[1]}"
-
-        print("\n--- ENTER denoise_step ---")
-        print("x_t:", x_t.shape)
-        print("timestep:", timestep.shape, timestep[0].item())
-        print("prefix_pad_masks:", prefix_pad_masks.shape)
-        print("suffix_position_ids:", suffix_position_ids.shape)
-        print("suffix_position_ids max:", suffix_position_ids.max().item())
-        model_dtype = next(self.reasoning_spatial_expert.parameters()).dtype
-        target_dtype = self.action_in_proj.weight.dtype
-        # x_t = x_t.to(target_dtype)
-        timestep = timestep.to(model_dtype)
-
-        """应用一步去噪。确保 Position IDs 与训练时完全一致。"""
-
-        if x_t.shape[-1] != self.action_in_proj.in_features: # 32
-            # 尝试恢复或报错。在推理时，x_t 必须是原始 action 空间的维度
-            raise ValueError(f"x_t dim mismatch! Expected {self.action_in_proj.in_features}, got {x_t.shape[-1]}")
-        # 1. 生成 Suffix (Action) 的嵌入
-        # 这里的 suffix_embs 应该包含所有的 action tokens (比如 36 个)
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(state, x_t, timestep)
-        suffix_embs = suffix_embs.to(model_dtype)
-
-        print("suffix_embs:", suffix_embs.shape)
-        print("suffix_pad_masks:", suffix_pad_masks.shape)
-        print("suffix_att_masks:", suffix_att_masks.shape)
-
-        
-
-
-        suffix_len = suffix_pad_masks.shape[1]
-        batch_size = prefix_pad_masks.shape[0]
-        prefix_len = prefix_pad_masks.shape[1] # 这里的 prefix_len 实际上是 (prefix + middle) 的总长
-
-        suffix_len = suffix_pad_masks.shape[1]
-
-        actual_position_ids = (
-            torch.arange(1, suffix_len + 1, device=suffix_embs.device)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-            + suffix_position_ids  # 这里的 suffix_position_ids 是前一阶段的 max_id
+        # 2) 拼接 mask，并构造 attention / position_ids（完全照抄 forward）
+        pad_masks = torch.cat(
+            [prefix_pad_masks, middle_pad_masks, suffix_pad_masks], dim=1
+        )
+        att_masks = torch.cat(
+            [prefix_att_masks, middle_att_masks, suffix_att_masks], dim=1
         )
 
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = self.get_position_ids(pad_masks)
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
-        # 2. 构造 2D Attention Mask
-        # 让 Suffix 能看到前面的所有缓存内容 (Prefix + Middle)
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
-        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
-        print("full_att_2d_masks:", full_att_2d_masks.shape)
-        print("full_att_2d_masks sum:", full_att_2d_masks.sum(dim=-1)[0][:5])
-
-        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        print("full_att_2d_masks_4d:", full_att_2d_masks_4d.shape)
-
-        #cposition_ids = torch.arange(1, suffix_len + 1).repeat(3, 1, 1).to(suffix_position_ids) + suffix_position_ids
-
-
-
-        # 3. 配置模型环境
-        self.reasoning_spatial_expert.action_expert.config._attn_implementation = "eager"
-
-        print("===== reasoning_spatial_expert.forward input shapes =====")
-
-        print("attention_mask:", 
-            None if full_att_2d_masks_4d is None else tuple(full_att_2d_masks_4d.shape))
-
-        print("position_ids:", 
-            None if actual_position_ids is None else tuple(actual_position_ids.shape))
-
-        if past_key_values is None:
-            print("past_key_values: None")
-        else:
-            print("past_key_values layers:", len(past_key_values))
-            k, v = past_key_values[0]
-            print("past_key_values[0].key:", tuple(k.shape))
-            print("past_key_values[0].value:", tuple(v.shape))
-
-        inputs_embeds = [None, None, suffix_embs]
-        for i, emb in enumerate(inputs_embeds):
-            print(f"inputs_embeds[{i}]:", 
-                None if emb is None else tuple(emb.shape))
-
-
-
-
-
-        # 4. 执行 Forward
-        # 注意：position_ids 现在直接使用传入的绝对物理 ID
-        outputs_embeds, _ = self.reasoning_spatial_expert.forward(
-            attention_mask=full_att_2d_masks_4d,
-            position_ids=actual_position_ids, # 【核心修改】
-            past_key_values=past_key_values,
-            inputs_embeds=[None, None, suffix_embs],
-            use_cache=False, 
+        # 3) 走与训练阶段完全相同的 MoT 前向：三个 expert 一起过 compute_layer_complete
+        (_, middle_out, suffix_out), _ = self.reasoning_spatial_expert.forward(
+            attention_mask=att_2d_masks_4d,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, middle_embs, suffix_embs],
+            use_cache=False,
         )
 
-        # 5. 提取输出并映射到 action 空间
-        # 这里的切片长度 (-36 或 -32) 必须根据你训练时的 loss 覆盖范围来定
-        # 如果训练是 suffix_out[:, -36 :], 这里也建议保持一致
-        suffix_out = outputs_embeds[2] 
-        
-        # config 或训练代码统一长度
-        # action_horizon = x_t.shape[1] # 动态获取，通常是 50
-        suffix_out = suffix_out[:, -self.action_horizon:, :] # 提取后 50 个 token
-    
-        suffix_out = suffix_out.to(dtype=target_dtype)
-
-        return self.action_out_proj(suffix_out)
+        # 4) 取出与训练 loss 一致的后 action_horizon 个 token，并投影回动作空间
+        suffix_out = suffix_out[:, -self.action_horizon :]
+        suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
+        v_t = self.action_out_proj(suffix_out)
+        return v_t
