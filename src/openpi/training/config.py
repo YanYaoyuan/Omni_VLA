@@ -773,7 +773,7 @@ _CONFIGS = [
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=False,
+            extra_delta_transform=True,
         ),
         batch_size=4,
         ema_decay=None,
@@ -855,16 +855,21 @@ _CONFIGS = [
         # We use RLDS data loading to make training on this large dataset tractable.
         # For fine-tuning on your own DROID dataset, see below.
         name="omni_droid_full_train",
-        model=pi0_config.Pi0Config(
-            action_dim=8,
-            action_horizon=16,
-            max_token_len=180,
-        ),
-        data=RLDSDroidDataConfig(
-            repo_id="droid",
-            # Set this to the path to your DROID RLDS dataset (the parent directory of the `droid` directory).
-            rlds_data_dir="<path_to_droid_rlds_dataset>", # e.g., "data/droid_rlds"
-            action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
+        # model=pi0_config.Pi0Config(
+        #     action_dim=8,
+        #     action_horizon=16,
+        #     max_token_len=180,
+        # ),
+        model=omni_config.OmniConfig(action_dim=8, action_horizon=16, max_token_len=180),
+        data=LeRobotDROIDDataConfig(
+            # Replace with your custom DROID LeRobot dataset repo id.
+            repo_id="/data/dataset/droid_1.0.1",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                # Important: reuse the original DROID norm stats during fine-tuning!
+                assets_dir="gs://openpi-assets/checkpoints/pi0_base/assets",
+                asset_id="droid",
+            ),
         ),
         # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -874,9 +879,9 @@ _CONFIGS = [
             decay_lr=5e-5,
         ),
         num_train_steps=100_000,  # 100k steps should be sufficient, takes ~2 days on 8x H100s
-        batch_size=1,
+        batch_size=2,
         log_interval=100,
-        save_interval=5000,
+        save_interval=10000,
         keep_period=20_000,
         num_workers=0,  # Important: RLDS DataLoader requires num_workers=0, handles multi-processing internally
     ),

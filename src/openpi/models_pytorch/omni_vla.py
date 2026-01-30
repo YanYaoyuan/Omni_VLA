@@ -192,6 +192,9 @@ class OmniVLA(nn.Module):
         for param in self.reasoning_spatial_expert.reasoning_expert.parameters():
             param.requires_grad = False
 
+        # for param in self.reasoning_spatial_expert.reasoning_expert.vision_tower.parameters():
+        #     param.requires_grad = False
+
         # 冻结spatial
         # for param in self.reasoning_spatial_expert.spatial_expert.parameters():
         #     param.requires_grad = False
