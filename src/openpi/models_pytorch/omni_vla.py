@@ -667,28 +667,26 @@ class OmniVLA(nn.Module):
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, middle_att_2d_masks], dim=2)
 
         # middle 的 position_ids 从 max_prefix_position_ids + 1 开始
-        # 参考实现：torch.arange(1, middle_len + 1).repeat(3, 1, 1).to(max_prefix_position_ids) + max_prefix_position_ids
-        # max_prefix_position_ids 形状: [batch_size, 1]
-        # 最终形状应该是 [batch_size, 3, middle_len]
-        middle_position_ids = torch.arange(1, middle_len + 1, dtype=torch.long, device=device)
-        middle_position_ids = middle_position_ids.repeat(3, 1, 1)  # [3, 1, middle_len]
-        middle_position_ids = middle_position_ids.to(max_prefix_position_ids.device, dtype=max_prefix_position_ids.dtype)
-        # 扩展维度并广播：[3, 1, middle_len] -> [1, 3, 1, middle_len]，然后与 [batch_size, 1, 1, 1] 相加
-        # 结果: [batch_size, 3, 1, middle_len]，然后 reshape 为 [batch_size, 3, middle_len]
-        middle_position_ids = (middle_position_ids.unsqueeze(0) + max_prefix_position_ids.unsqueeze(1).unsqueeze(-1)).squeeze(2)
+        # 对于单独调用 spatial_expert，需要 [batch_size, middle_len] 的形状
+        # 索引 1 对应 spatial_expert（reasoning=0, spatial=1, action=2）
+        middle_position_ids_2d = torch.arange(1, middle_len + 1, dtype=torch.long, device=device)
+        middle_position_ids_2d = middle_position_ids_2d.unsqueeze(0).expand(batch_size, -1)  # [batch_size, middle_len]
+        middle_position_ids_2d = middle_position_ids_2d + max_prefix_position_ids.squeeze(-1)  # [batch_size, middle_len]
 
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
 
         # 处理 middle，复用 prefix 的 KV cache
+        # 注意：单独调用 expert 时，position_ids 应该是 [batch_size, seq_len] 的形状
         (_, middle_out, _), past_key_values = self.reasoning_spatial_expert.forward(
             attention_mask=full_att_2d_masks_4d,
-            position_ids=middle_position_ids,
+            position_ids=middle_position_ids_2d,
             past_key_values=past_key_values,
             inputs_embeds=[None, middle_embs, None],
             use_cache=True,
         )
 
-        max_position_ids = middle_position_ids.max(dim=-1, keepdim=True).values
+        # 保存 max_position_ids 用于后续 suffix 的 position_ids 计算
+        max_position_ids = middle_position_ids_2d.max(dim=-1, keepdim=True).values  # [batch_size, 1]
         curr_pad_masks = torch.cat([prefix_pad_masks, middle_pad_masks], dim=1)
 
         # 3. 去噪循环：每次只处理 suffix，复用 prefix 和 middle 的 KV cache
@@ -741,16 +739,12 @@ class OmniVLA(nn.Module):
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
 
         # suffix 的 position_ids 从 max_position_ids + 1 开始
-        # 参考实现：torch.arange(1, suffix_len + 1).repeat(3, 1, 1).to(max_prefix_position_ids) + max_prefix_position_ids
-        # max_position_ids 形状: [batch_size, 3, 1]
-        # 最终形状应该是 [batch_size, 3, suffix_len]
+        # 对于单独调用 action_expert，需要 [batch_size, suffix_len] 的形状
+        # 索引 2 对应 action_expert（reasoning=0, spatial=1, action=2）
         device = suffix_embs.device
         position_ids = torch.arange(1, suffix_len + 1, dtype=torch.long, device=device)
-        position_ids = position_ids.repeat(3, 1, 1)  # [3, 1, suffix_len]
-        position_ids = position_ids.to(max_position_ids.device, dtype=max_position_ids.dtype)
-        # 扩展维度并广播：[3, 1, suffix_len] -> [1, 3, 1, suffix_len]，然后与 [batch_size, 3, 1, 1] 相加
-        # 结果: [batch_size, 3, 1, suffix_len]，然后 reshape 为 [batch_size, 3, suffix_len]
-        position_ids = (position_ids.unsqueeze(0) + max_position_ids.unsqueeze(-1)).squeeze(2)
+        position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)  # [batch_size, suffix_len]
+        position_ids = position_ids + max_position_ids.squeeze(-1)  # [batch_size, suffix_len]
 
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
 
