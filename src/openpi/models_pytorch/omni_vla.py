@@ -603,9 +603,10 @@ class OmniVLA(nn.Module):
     @torch.no_grad()
     def sample_actions(self, observation, device=None, noise=None, num_steps: int = 10) -> Tensor:
         """
-        推理版采样：为了保证与训练前向完全一致，
-        每个去噪步骤都重新跑一遍 prefix + middle + suffix 的 MoT 前向（不使用 KV cache）。
-        这样虽然更慢，但可以先验证训练出来的模型在推理时是合理的。
+        推理版采样：使用 KV cache 加速推理。
+        1. 先处理 prefix（语言+图像），得到 past_key_values
+        2. 再处理 middle（空间特征），复用 prefix 的 KV cache
+        3. 去噪循环中，每次只处理 suffix，复用 prefix 和 middle 的 KV cache
         """
         if num_steps is None:
             num_steps = self.config.num_inference_steps
@@ -633,16 +634,73 @@ class OmniVLA(nn.Module):
         self.reasoning_spatial_expert.spatial_expert.config._attn_implementation = "eager"  # noqa: SLF001
         self.reasoning_spatial_expert.action_expert.config._attn_implementation = "eager"  # noqa: SLF001
 
+        # 1. 处理 prefix（语言+图像）
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = self.get_position_ids(prefix_pad_masks)
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+
+        # 处理 prefix，得到 past_key_values
+        _, past_key_values = self.reasoning_spatial_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None, None],
+            use_cache=True,
+        )
+        max_prefix_position_ids = prefix_position_ids.max(dim=-1, keepdim=True).values
+
+        # 2. 处理 middle（空间特征）
+        middle_embs, middle_pad_masks, middle_att_masks = self.embed_spatial(
+            images, img_masks
+        )
+
+        middle_len = middle_pad_masks.shape[1]
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+        
+        # 构建 prefix + middle 的 attention mask
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, middle_len, prefix_len)
+        middle_att_2d_masks = make_att_2d_masks(middle_pad_masks, middle_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, middle_att_2d_masks], dim=2)
+
+        # middle 的 position_ids 从 max_prefix_position_ids + 1 开始
+        # 参考实现：torch.arange(1, middle_len + 1).repeat(3, 1, 1).to(max_prefix_position_ids) + max_prefix_position_ids
+        # max_prefix_position_ids 形状: [batch_size, 1]
+        # 最终形状应该是 [batch_size, 3, middle_len]
+        middle_position_ids = torch.arange(1, middle_len + 1, dtype=torch.long, device=device)
+        middle_position_ids = middle_position_ids.repeat(3, 1, 1)  # [3, 1, middle_len]
+        middle_position_ids = middle_position_ids.to(max_prefix_position_ids.device, dtype=max_prefix_position_ids.dtype)
+        # 扩展维度并广播：[3, 1, middle_len] -> [1, 3, 1, middle_len]，然后与 [batch_size, 1, 1, 1] 相加
+        # 结果: [batch_size, 3, 1, middle_len]，然后 reshape 为 [batch_size, 3, middle_len]
+        middle_position_ids = (middle_position_ids.unsqueeze(0) + max_prefix_position_ids.unsqueeze(1).unsqueeze(-1)).squeeze(2)
+
+        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+
+        # 处理 middle，复用 prefix 的 KV cache
+        (_, middle_out, _), past_key_values = self.reasoning_spatial_expert.forward(
+            attention_mask=full_att_2d_masks_4d,
+            position_ids=middle_position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[None, middle_embs, None],
+            use_cache=True,
+        )
+
+        max_position_ids = middle_position_ids.max(dim=-1, keepdim=True).values
+        curr_pad_masks = torch.cat([prefix_pad_masks, middle_pad_masks], dim=1)
+
+        # 3. 去噪循环：每次只处理 suffix，复用 prefix 和 middle 的 KV cache
         while time >= -dt / 2:
             expanded_time = time.expand(bsize).to(target_dtype)
             v_t = self.denoise_step(
-                images=images,
-                img_masks=img_masks,
-                lang_tokens=lang_tokens,
-                lang_masks=lang_masks,
                 state=state,
-                x_t=x_t,
-                timestep=expanded_time,
+                prefix_pad_masks=curr_pad_masks,
+                past_key_values=past_key_values,
+                max_position_ids=max_position_ids,
+                x_t=x_t.to(target_dtype),
+                timestep=expanded_time.to(torch.float32),
             )
             x_t = x_t + dt * v_t
             time = (time + dt).to(target_dtype)
@@ -651,26 +709,15 @@ class OmniVLA(nn.Module):
 
     def denoise_step(
         self,
-        images,
-        img_masks,
-        lang_tokens,
-        lang_masks,
         state,
+        prefix_pad_masks,
+        past_key_values,
+        max_position_ids,
         x_t,
         timestep,
     ):
-        """单步去噪：严格复用训练时的 MoT 计算路径。"""
-        # 1) 生成 prefix / middle / suffix 三段 embedding
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
-        )
-        middle_embs, middle_pad_masks, middle_att_masks = self.embed_spatial(
-            images, img_masks
-        )
-
-        # timestep: [B]，x_t: [B, H, 32]
-        # embed_suffix 里会自动把 state / x_t / timestep 拼成训练时一样的 suffix 序列
-        timestep = timestep.to(torch.float32)
+        """单步去噪：只处理 suffix，复用 prefix 和 middle 的 KV cache。"""
+        # 1) 只生成 suffix embedding
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
             state, x_t, timestep
         )
@@ -682,32 +729,42 @@ class OmniVLA(nn.Module):
             ].self_attn.q_proj.weight.dtype
             == torch.bfloat16
         ):
-            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
-            middle_embs = middle_embs.to(dtype=torch.bfloat16)
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
 
-        # 2) 拼接 mask，并构造 attention / position_ids（完全照抄 forward）
-        pad_masks = torch.cat(
-            [prefix_pad_masks, middle_pad_masks, suffix_pad_masks], dim=1
-        )
-        att_masks = torch.cat(
-            [prefix_att_masks, middle_att_masks, suffix_att_masks], dim=1
-        )
+        # 2) 构建 prefix + suffix 的 attention mask
+        suffix_len = suffix_pad_masks.shape[1]
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
 
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = self.get_position_ids(pad_masks)
-        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
 
-        # 3) 走与训练阶段完全相同的 MoT 前向：三个 expert 一起过 compute_layer_complete
-        (_, middle_out, suffix_out), _ = self.reasoning_spatial_expert.forward(
-            attention_mask=att_2d_masks_4d,
+        # suffix 的 position_ids 从 max_position_ids + 1 开始
+        # 参考实现：torch.arange(1, suffix_len + 1).repeat(3, 1, 1).to(max_prefix_position_ids) + max_prefix_position_ids
+        # max_position_ids 形状: [batch_size, 3, 1]
+        # 最终形状应该是 [batch_size, 3, suffix_len]
+        device = suffix_embs.device
+        position_ids = torch.arange(1, suffix_len + 1, dtype=torch.long, device=device)
+        position_ids = position_ids.repeat(3, 1, 1)  # [3, 1, suffix_len]
+        position_ids = position_ids.to(max_position_ids.device, dtype=max_position_ids.dtype)
+        # 扩展维度并广播：[3, 1, suffix_len] -> [1, 3, 1, suffix_len]，然后与 [batch_size, 3, 1, 1] 相加
+        # 结果: [batch_size, 3, 1, suffix_len]，然后 reshape 为 [batch_size, 3, suffix_len]
+        position_ids = (position_ids.unsqueeze(0) + max_position_ids.unsqueeze(-1)).squeeze(2)
+
+        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+
+        # 3) 只处理 suffix，复用 prefix 和 middle 的 KV cache
+        outputs_embeds, _ = self.reasoning_spatial_expert.forward(
+            attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, middle_embs, suffix_embs],
-            use_cache=False,
+            past_key_values=past_key_values,
+            inputs_embeds=[None, None, suffix_embs],
+            use_cache=False,  # suffix 每次都在变，不需要 cache
         )
 
         # 4) 取出与训练 loss 一致的后 action_horizon 个 token，并投影回动作空间
+        suffix_out = outputs_embeds[2]
         suffix_out = suffix_out[:, -self.action_horizon :]
         suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
         v_t = self.action_out_proj(suffix_out)
