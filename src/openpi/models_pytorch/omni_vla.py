@@ -731,10 +731,17 @@ class OmniVLA(nn.Module):
 
         # 2) 构建 attention mask
         # 当使用 KV cache 时，attention mask 需要覆盖整个序列（缓存的 + 新的）
-        # prefix_pad_masks 已经包含了 prefix + middle（缓存的序列）
+        # 从 past_key_values 获取实际的缓存序列长度
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
-        cached_seq_len = prefix_pad_masks.shape[1]  # prefix + middle 的长度
+        
+        # 从 past_key_values 获取实际的缓存序列长度
+        if past_key_values is not None:
+            # past_key_values 是一个 Cache 对象，使用 get_seq_length() 获取缓存长度
+            cached_seq_len = past_key_values.get_seq_length()
+        else:
+            # 如果没有 cache，使用 prefix_pad_masks 的长度
+            cached_seq_len = prefix_pad_masks.shape[1]
         
         # 构建完整的 attention mask：[batch_size, suffix_len, cached_seq_len + suffix_len]
         # 对于缓存的序列，所有位置都可以被 attend
