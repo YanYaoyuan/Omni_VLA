@@ -729,14 +729,20 @@ class OmniVLA(nn.Module):
         ):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
 
-        # 2) 构建 prefix + suffix 的 attention mask
+        # 2) 构建 attention mask
+        # 当使用 KV cache 时，attention mask 需要覆盖整个序列（缓存的 + 新的）
+        # prefix_pad_masks 已经包含了 prefix + middle（缓存的序列）
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
-        prefix_len = prefix_pad_masks.shape[1]
-
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        cached_seq_len = prefix_pad_masks.shape[1]  # prefix + middle 的长度
+        
+        # 构建完整的 attention mask：[batch_size, suffix_len, cached_seq_len + suffix_len]
+        # 对于缓存的序列，所有位置都可以被 attend
+        cached_mask = torch.ones(batch_size, suffix_len, cached_seq_len, dtype=torch.bool, device=suffix_pad_masks.device)
+        # 对于新的序列（suffix），使用 make_att_2d_masks
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+        # 拼接：缓存的序列在前，新的序列在后
+        full_att_2d_masks = torch.cat([cached_mask, suffix_att_2d_masks], dim=2)
 
         # suffix 的 position_ids 从 max_position_ids + 1 开始
         # 对于单独调用 action_expert，需要 [batch_size, suffix_len] 的形状
