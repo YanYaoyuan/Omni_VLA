@@ -46,11 +46,8 @@ def compute_layer_complete(
     #     key_states.append(key_state)
     #     value_states.append(value_state)
     for i, hidden_states in enumerate(inputs_embeds):
-        # models[0] 是 GemmaModel，直接有 .layers；models[1]和[2]是 GemmaForCausalLM，需要 .model.layers
-        if i == 0:
-            layer = models[i].layers[layer_idx]
-        else:
-            layer = models[i].model.layers[layer_idx]
+        # 所有 models 都是 GemmaForCausalLM，需要 .model.layers
+        layer = models[i].model.layers[layer_idx]
         hidden_states = layer.input_layernorm(hidden_states)  # noqa: PLW2901
 
         input_shape = hidden_states.shape[:-1]
@@ -67,8 +64,8 @@ def compute_layer_complete(
     key_states = torch.cat(key_states, dim=2)
     value_states = torch.cat(value_states, dim=2)
     
-    # reasoning_expert.language_model 已经是 GemmaModel，直接有 .rotary_emb
-    cos, sin = reasoning_expert.language_model.rotary_emb(query_states, position_ids)
+    # reasoning_expert.language_model 是 GemmaForCausalLM，需要 .model.rotary_emb
+    cos, sin = reasoning_expert.language_model.model.rotary_emb(query_states, position_ids)
 
     # seq_len = query_states.shape[2]
 
@@ -99,11 +96,11 @@ def compute_layer_complete(
         query_states, key_states, cos, sin, unsqueeze_dim=1
     )
     batch_size = query_states.shape[0]
-    # reasoning_expert.language_model 已经是 GemmaModel，直接有 .layers
-    scaling = reasoning_expert.language_model.layers[layer_idx].self_attn.scaling
+    # reasoning_expert.language_model 是 GemmaForCausalLM，需要 .model.layers
+    scaling = reasoning_expert.language_model.model.layers[layer_idx].self_attn.scaling
     # Attention computation
     att_output, _ = modeling_gemma.eager_attention_forward(
-        reasoning_expert.language_model.layers[layer_idx].self_attn,
+        reasoning_expert.language_model.model.layers[layer_idx].self_attn,
         query_states,
         key_states,
         value_states,
@@ -111,18 +108,15 @@ def compute_layer_complete(
         scaling,
     )
     # Get head_dim from the current layer, not from the model
-    head_dim = reasoning_expert.language_model.layers[layer_idx].self_attn.head_dim
-    num_attention_heads = reasoning_expert.language_model.layers[layer_idx].self_attn.config.num_attention_heads
+    head_dim = reasoning_expert.language_model.model.layers[layer_idx].self_attn.head_dim
+    num_attention_heads = reasoning_expert.language_model.model.layers[layer_idx].self_attn.config.num_attention_heads
     att_output = att_output.reshape(batch_size, -1, 1 * num_attention_heads * head_dim)
     # Process layer outputs
     outputs_embeds = []
     start_pos = 0
     for i, hidden_states in enumerate(inputs_embeds):
-        # models[0] 是 GemmaModel，直接有 .layers；models[1]和[2]是 GemmaForCausalLM，需要 .model.layers
-        if i == 0:
-            layer = models[i].layers[layer_idx]
-        else:
-            layer = models[i].model.layers[layer_idx]
+        # 所有 models 都是 GemmaForCausalLM，需要 .model.layers
+        layer = models[i].model.layers[layer_idx]
         end_pos = start_pos + hidden_states.shape[1]
         if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
             att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
@@ -381,11 +375,8 @@ class VLMWithSpatialActionExpertModel(
             def compute_final_norms(inputs_embeds):
                 outputs_embeds = []
                 for i, hidden_states in enumerate(inputs_embeds):
-                    # models[0] 是 GemmaModel，直接有 .norm；models[1]和[2]是 GemmaForCausalLM，需要 .model.norm
-                    if i == 0:
-                        out_emb = models[i].norm(hidden_states)
-                    else:
-                        out_emb = models[i].model.norm(hidden_states)
+                    # 所有 models 都是 GemmaForCausalLM，需要 .model.norm
+                    out_emb = models[i].model.norm(hidden_states)
                     outputs_embeds.append(out_emb)
                 return outputs_embeds
 
