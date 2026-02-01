@@ -730,19 +730,29 @@ class OmniVLA(nn.Module):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
 
         # 2) 构建 attention mask
-        # prefix_pad_masks 包含了 prefix 和 middle 的 masks（在 sample_actions 中已经拼接）
-        # 当使用 KV cache 时，attention mask 需要覆盖整个序列（缓存的 + 新的）
+        # 当使用 KV cache 时，transformers 会自动处理 attention mask
+        # 我们只需要为新序列（suffix）构建 attention mask
+        # transformers 内部会自动将其扩展到包含缓存序列的总长度
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
-        prefix_len = prefix_pad_masks.shape[1]
         
-        # 构建完整的 attention mask：[batch_size, suffix_len, prefix_len + suffix_len]
-        # 对于缓存的序列（prefix + middle），使用 prefix_pad_masks 扩展
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
-        # 对于新的序列（suffix），使用 make_att_2d_masks
+        # 只构建 suffix 的 attention mask
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-        # 拼接：缓存的序列在前，新的序列在后
-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+        
+        # 当使用 KV cache 时，需要构建包含缓存序列的完整 attention mask
+        # 从 past_key_values 获取实际的缓存序列长度
+        if past_key_values is not None:
+            cached_seq_len = past_key_values.get_seq_length()
+        else:
+            cached_seq_len = 0
+        
+        # 构建完整的 attention mask：[batch_size, suffix_len, cached_seq_len + suffix_len]
+        # 对于缓存的序列，所有位置都可以被 attend（全1）
+        if cached_seq_len > 0:
+            cached_mask = torch.ones(batch_size, suffix_len, cached_seq_len, dtype=torch.bool, device=suffix_pad_masks.device)
+            full_att_2d_masks = torch.cat([cached_mask, suffix_att_2d_masks], dim=2)
+        else:
+            full_att_2d_masks = suffix_att_2d_masks
 
         # suffix 的 position_ids 从 max_position_ids + 1 开始
         # 对于单独调用 action_expert，需要 [batch_size, suffix_len] 的形状
