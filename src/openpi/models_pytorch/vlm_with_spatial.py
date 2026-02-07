@@ -337,13 +337,13 @@ class VLMWithSpatialActionExpertModel(
             models = [self.reasoning_expert.language_model, self.spatial_expert, self.action_expert]
             num_layers = self.reasoning_expert.config.text_config.num_hidden_layers
 
-            # Check if gradient checkpointing is enabled for any of the models
+            # Check if gradient checkpointing is enabled (flag 在 omni_vla 里设到 .model 上，与 g2vlm_pi0 一致)
             use_gradient_checkpointing = (
-                hasattr(self.action_expert, "gradient_checkpointing")
-                and self.spatial_expert.gradient_checkpointing
-                and self.action_expert.gradient_checkpointing
+                getattr(self.reasoning_expert.language_model, "gradient_checkpointing", False)
+                and getattr(self.spatial_expert.model, "gradient_checkpointing", False)
+                and getattr(self.action_expert.model, "gradient_checkpointing", False)
                 and self.training
-            ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
+            ) or (getattr(self, "gradient_checkpointing", False) and self.training)
 
             # Process all layers with gradient checkpointing if enabled
             for layer_idx in range(num_layers):

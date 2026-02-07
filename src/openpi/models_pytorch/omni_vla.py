@@ -210,23 +210,30 @@ class OmniVLA(nn.Module):
         
 
     def set_requires_grad(self):
-        if self.config.freeze_vision_encoder:
-            self.reasoning_spatial_expert.visual.eval()
-            for params in self.reasoning_spatial_expert.und_expert.visual.parameters():
-                params.requires_grad = False
+        """按 config 设置各 expert 的 requires_grad（与当前三专家 MOT 结构一致）。"""
+        if getattr(self.config, "freeze_vision_encoder", False):
+            self.reasoning_spatial_expert.reasoning_expert.vision_tower.eval()
+            for p in self.reasoning_spatial_expert.reasoning_expert.vision_tower.parameters():
+                p.requires_grad = False
 
-        if self.config.train_expert_only:
-            self.reasoning_spatial_expert.und_expert.eval()
-            for params in self.reasoning_spatial_expert.und_expert.parameters():
-                params.requires_grad = False
-        
-        if self.config.train_vlm_only:
-            self.reasoning_spatial_expert.gen_expert.eval()
-            for params in self.reasoning_spatial_expert.gen_expert.parameters():
-                params.requires_grad = False
-            self.reasoning_spatial_expert.act_expert.eval()
-            for params in self.reasoning_spatial_expert.act_expert.parameters():
-                params.requires_grad = False
+        if getattr(self.config, "train_expert_only", False):
+            self.reasoning_spatial_expert.reasoning_expert.eval()
+            for p in self.reasoning_spatial_expert.reasoning_expert.parameters():
+                p.requires_grad = False
+            self.reasoning_spatial_expert.spatial_expert.eval()
+            for p in self.reasoning_spatial_expert.spatial_expert.parameters():
+                p.requires_grad = False
+
+        if getattr(self.config, "train_vlm_only", False):
+            self.reasoning_spatial_expert.reasoning_expert.eval()
+            for p in self.reasoning_spatial_expert.reasoning_expert.parameters():
+                p.requires_grad = False
+            self.reasoning_spatial_expert.spatial_expert.eval()
+            for p in self.reasoning_spatial_expert.spatial_expert.parameters():
+                p.requires_grad = False
+            self.reasoning_spatial_expert.action_expert.eval()
+            for p in self.reasoning_spatial_expert.action_expert.parameters():
+                p.requires_grad = False
         
     
     def train(self, mode: bool = True):
@@ -456,7 +463,8 @@ class OmniVLA(nn.Module):
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
+        # 与 prefix/middle 一致用 bool，否则 torch.cat([prefix_att_masks, middle_att_masks, suffix_att_masks]) 会因 dtype 不一致报错
+        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=embs.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
         return embs, pad_masks, att_masks
@@ -517,13 +525,18 @@ class OmniVLA(nn.Module):
         return actions
     
     def prepare_spatial_features(self, batch):
+        """用 VGGT 做空间特征（与 embed_spatial 一致）；若需其他 backbone 可在此扩展。"""
         images = torch.stack([batch[f"{OBS_IMAGES}.image{i}"] for i in range(3)], dim=1)  # B, N_view, T, C, H, W
         B, N_view, T = images.shape[:3]
-        images = rearrange(images, 'b n t c h w -> (b n t) c h w')
+        images = rearrange(images, "b n t c h w -> (b n t) c h w")
         images = F.interpolate(images, size=(256, 256), mode="bilinear", align_corners=False)
-        images = images * 2 - 1  # [-1, 1]
-        features = self.model.cosmos.encode(images)
-        features = rearrange(features, '(b n t) c h w -> b n t c h w', b=B, n=N_view, t=T)
+        images = images * 2 - 1
+        # VGGT 需要 [B, S, C, H, W]
+        images_5d = rearrange(images, "(b n t) c h w -> b (n t) c h w", b=B, n=N_view, t=T)
+        with torch.no_grad():
+            res = self.reasoning_spatial_expert.vggt_encoder(images_5d)
+        features = res["features"][-1]  # [B, N_view*T, N, D]
+        features = rearrange(features, "b (n t) N d -> b n t N d", n=N_view, t=T)
         return features
 
     def forward(
