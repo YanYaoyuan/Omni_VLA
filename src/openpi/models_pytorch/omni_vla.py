@@ -493,7 +493,7 @@ class OmniVLA(nn.Module):
         prefix_embs, prefix_pad_masks, prefix_att_masks, prefix_token_type_ids  = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
-            self.g2vlm_with_expert.g2vlm.language_model.base_model.layers[0].self_attn.q_proj.weight.dtype
+            self.g2vlm_with_expert.g2vlm.language_model.model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
         ):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
@@ -571,24 +571,8 @@ class OmniVLA(nn.Module):
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks, prefix_token_type_ids = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        # Compute image and language key value cache
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        # Set attention implementation (only for PaliGemma)
-        if not self.use_pre_g2vlm:
-            self.g2vlm_with_expert.action_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        _, past_key_values = self.g2vlm_with_expert.forward(
-            observation = observation,
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
-
+        # G2VLM 的 cache 与 Gemma 不兼容，推理时每步用 Case 3 联合 forward(prefix_embs, suffix_embs)，不依赖 prefill cache
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
@@ -599,7 +583,7 @@ class OmniVLA(nn.Module):
             v_t = self.denoise_step(
                 state,
                 prefix_pad_masks,
-                past_key_values,
+                prefix_embs,
                 x_t,
                 expanded_time,
             )
@@ -613,37 +597,37 @@ class OmniVLA(nn.Module):
         self,
         state,
         prefix_pad_masks,
-        past_key_values,
+        prefix_embs,
         x_t,
         timestep,
     ):
-        """Apply one denoising step of the noise `x_t` at a given timestep."""
+        """Apply one denoising step of the noise `x_t` at a given timestep.
+        使用 Case 3 联合 forward(prefix_embs, suffix_embs)，position_ids 由 forward 内根据 current_vit_grid/dino_grid 构建。
+        """
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
-        prefix_len = prefix_pad_masks.shape[1]
 
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        if (
+            self.g2vlm_with_expert.g2vlm.language_model.model.layers[0].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        ):
+            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
-        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-
-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
-
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
-
-        # Prepare attention masks
-        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        # Set attention implementation (only for PaliGemma)
+        # 与训练一致：用 build_pi0_attention_mask 构造 prefix+suffix 的因果掩码
+        att_2d_masks_4d = self.build_pi0_attention_mask(prefix_pad_masks, suffix_len)
+        # position_ids=None 时 G2VLM forward Case 3 会按 current_vit_grid/current_dino_grid 构建 3D position_ids
         if not self.use_pre_g2vlm:
             self.g2vlm_with_expert.action_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
         outputs_embeds, _ = self.g2vlm_with_expert.forward(
-            attention_mask=full_att_2d_masks_4d,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=[None, suffix_embs],
+            observation=None,
+            attention_mask=att_2d_masks_4d,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
             use_cache=False,
             adarms_cond=[None, adarms_cond],
         )

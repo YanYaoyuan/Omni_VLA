@@ -252,17 +252,21 @@ def load_model_and_tokenizer(model_path, use_pretrained_g2vlm, device):
     return model, tokenizer, new_token_ids, vit_image_transform, dino_transform, llm_config
 
 
-# ---------- 1. 三专家 MoT ----------
+# ---------- 1. 与 PI0 一致的 Action Expert 封装（对照 gemma_pytorch.PaliGemmaWithExpertModel）----------
 class G2VLMWithActorExpertModel(nn.Module):
     """
-    官方 PaliGemmaWithExpertModel 的“三专家”版：
-    - prefix:  image+text  →  Semantic  Expert (PaliGemma, 冻结)
-    - prefix:  dino→3D     →  Geometric Expert (G2VLM, 冻结)
-    - suffix:  state+action → Action    Expert (Gemma-300M, 可训)
-    共享 Self-Attention，FFN 按 token 类型路由。
-    """
+    与 PI0 的 PaliGemmaWithExpertModel 同构的“VLM + Action Expert”封装，见 gemma_pytorch.py：
 
-    """G2VLM model with action expert for PI0, replacing PaliGemmaWithExpertModel."""
+    - 结构：prefix expert（VLM 的 language 部分）+ action expert（小 Gemma），同层数、同 hidden/heads。
+    - 接口：embed_image / embed_language_tokens；forward(attention_mask, position_ids, past_key_values, inputs_embeds=[prefix_embs, suffix_embs], use_cache, adarms_cond)。
+    - 三分支（与 gemma_pytorch 第 101-124 行一致）：
+      Case 1: inputs_embeds[1] is None → 只跑 prefix，拿 last_hidden_state + past_key_values（prefill）。
+      Case 2: inputs_embeds[0] is None → 只跑 action expert（decode）。
+      Case 3: 两者都有 → 联合 attention：两路各自 LayerNorm → Q/K/V → concat → 共享 attention → 拆回两路 → 各自 o_proj + residual → 各自 FFN + residual（与 gemma_pytorch compute_layer_complete 一致）。
+
+    唯一差别：PI0 的 prefix 是 PaliGemma.language_model.forward(inputs_embeds=..., ...)（HF 接口）；
+    这里 prefix 是 G2VLM 的 Qwen2，内部是 packed 接口，故 Case 1 里先把 prefix_embs 转 packed 再调 forward_inference。
+    """
 
     def __init__(
         self,
@@ -561,25 +565,47 @@ class G2VLMWithActorExpertModel(nn.Module):
         if adarms_cond is None:
             adarms_cond = [None, None]
 
+        # 与 gemma_pytorch.PaliGemmaWithExpertModel.forward 三分支一致（gemma_pytorch 第 101-124 行）
         # --------------------------------------------------
-        # Case 1: only prefix (encode / prefill)，与 PI0 一致：用 prefix_embs 而非 input_ids
+        # Case 1: 仅 prefix（prefill）→ 对应 paligemma.language_model.forward(inputs_embeds[0], ...)
+        # G2VLM 的 Qwen2 为 packed 接口，故先转 packed 再 forward_inference
         # --------------------------------------------------
         if inputs_embeds[1] is None:
-            # Qwen2VL base_model.forward 无 adarms_cond，仅支持：input_ids/inputs_embeds, attention_mask, position_ids, past_key_values, use_cache, cache_position 等
-            prefix_output = self.g2vlm.language_model.base_model.forward(
-                input_ids=None,
-                inputs_embeds=inputs_embeds[0],
-                attention_mask=attention_mask,
-                position_ids=position_ids,
+            prefix_embs = inputs_embeds[0]  # [B, L, D]
+            B, L, D = prefix_embs.shape
+            device = prefix_embs.device
+            # 转为 packed 格式：packed_query_sequence (B*L, D), query_lens [L]*B
+            packed_query_sequence = prefix_embs.reshape(B * L, D)
+            query_lens = torch.full((B,), L, dtype=torch.long, device=device)
+            # position_ids: 可为 [3, B, L] 或 [B, L]（sample_actions 传 2D）→ 统一为 [3, B*L]
+            if position_ids is not None:
+                if position_ids.dim() == 2:
+                    position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+                packed_query_position_ids = position_ids.reshape(3, B * L)
+            else:
+                packed_query_position_ids = torch.arange(B * L, device=device).unsqueeze(0).expand(3, -1)
+            packed_query_indexes = torch.arange(B * L, device=device)
+            key_values_lens = torch.zeros(B, dtype=torch.long, device=device)
+            packed_key_value_indexes = torch.zeros(0, dtype=torch.long, device=device)
+
+            outputs = self.g2vlm.language_model.forward_inference(
+                packed_query_sequence=packed_query_sequence,
+                query_lens=query_lens,
+                packed_query_position_ids=packed_query_position_ids,
+                packed_query_indexes=packed_query_indexes,
                 past_key_values=past_key_values,
-                use_cache=use_cache,
+                key_values_lens=key_values_lens,
+                packed_key_value_indexes=packed_key_value_indexes,
+                update_past_key_values=use_cache if use_cache is not None else True,
+                is_causal=True,
+                mode="und",
             )
-            prefix_past_key_values = prefix_output.past_key_values
-            prefix_output = prefix_output.last_hidden_state
+            prefix_past_key_values = outputs.past_key_values
+            prefix_output = outputs.packed_query_sequence  # (B*L, D)，与 HF 的 last_hidden_state 语义一致
             suffix_output = None
 
         # --------------------------------------------------
-        # Case 2: only suffix (decode action)
+        # Case 2: 仅 suffix（decode action）→ 对应 gemma_expert.model.forward(inputs_embeds[1], ...)
         # --------------------------------------------------
         elif inputs_embeds[0] is None:
             suffix_output = self.action_expert.model.forward(
@@ -595,10 +621,9 @@ class G2VLMWithActorExpertModel(nn.Module):
             prefix_past_key_values = None
 
         # --------------------------------------------------
-        # Case 3: prefix + suffix joint attention (PI-0 core)
+        # Case 3: prefix + suffix 联合 attention（与 gemma_pytorch compute_layer_complete 同构）
         # --------------------------------------------------
         else:
-            # 🔑 和原 PI-0 完全一致，只是换了 prefix model
             models = [
                 self.g2vlm.language_model,   # prefix expert (semantic + geometric + text)
                 self.action_expert.model,     # suffix expert (action)
@@ -716,7 +741,7 @@ class G2VLMWithActorExpertModel(nn.Module):
 
                 for i, hidden_states in enumerate(inputs_embeds):
 
-                    layer = models[i].base_model.layers[layer_idx]
+                    layer = models[i].model.layers[layer_idx]
                     hidden_states = layer.input_layernorm(hidden_states)  # 不传 cond
                     # 创建全 1 gate，占位
                     gate = torch.full_like(hidden_states, 0.001)
@@ -762,7 +787,7 @@ class G2VLMWithActorExpertModel(nn.Module):
 
 
                 # 1. 获取 3D 旋转频率
-                rope_module = models[0].base_model.layers[0].self_attn.rotary_emb
+                rope_module = models[0].model.layers[0].self_attn.rotary_emb
 
                 prefix_len = inputs_embeds[0].shape[1]
                 suffix_len = inputs_embeds[1].shape[1]
@@ -820,7 +845,7 @@ class G2VLMWithActorExpertModel(nn.Module):
                 # )
 
                 # 尝试获取，如果获取不到则手动计算
-                attn_module = models[0].base_model.layers[layer_idx].self_attn
+                attn_module = models[0].model.layers[layer_idx].self_attn
                 if hasattr(attn_module, "scaling"):
                     scaling = attn_module.scaling
                 else:
@@ -866,7 +891,7 @@ class G2VLMWithActorExpertModel(nn.Module):
                 logging.debug("Final Q: %s K: %s", query_states.shape, key_states.shape)
 
                 att_output, _ = modeling_gemma.eager_attention_forward(
-                    models[0].base_model.layers[layer_idx].self_attn,
+                    models[0].model.layers[layer_idx].self_attn,
                     query_states,
                     key_states,
                     value_states,
@@ -874,14 +899,14 @@ class G2VLMWithActorExpertModel(nn.Module):
                     scaling,
                 )
 
-                head_dim = models[0].base_model.layers[layer_idx].self_attn.head_dim
-                num_heads = models[0].base_model.layers[layer_idx].self_attn.num_heads
+                head_dim = models[0].model.layers[layer_idx].self_attn.head_dim
+                num_heads = models[0].model.layers[layer_idx].self_attn.num_heads
                 att_output = att_output.reshape(att_output.shape[0], -1, num_heads * head_dim)
 
                 outputs = []
                 start = 0
                 for i, hidden_states in enumerate(inputs_embeds):
-                    layer = models[i].base_model.layers[layer_idx]
+                    layer = models[i].model.layers[layer_idx]
                     expert_dtype = layer.mlp.gate_proj.weight.dtype
 
                     end = start + hidden_states.shape[1]
@@ -926,7 +951,7 @@ class G2VLMWithActorExpertModel(nn.Module):
             # final norm
             outputs = []
             for i, hidden_states in enumerate(inputs_embeds):
-                out = models[i].base_model.norm(hidden_states)
+                out = models[i].model.norm(hidden_states)
                 outputs.append(out)
 
             prefix_output, suffix_output = outputs
