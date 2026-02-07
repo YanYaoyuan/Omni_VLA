@@ -565,6 +565,7 @@ class G2VLMWithActorExpertModel(nn.Module):
         # Case 1: only prefix (encode / prefill)，与 PI0 一致：用 prefix_embs 而非 input_ids
         # --------------------------------------------------
         if inputs_embeds[1] is None:
+            # Qwen2VL base_model.forward 无 adarms_cond，仅支持：input_ids/inputs_embeds, attention_mask, position_ids, past_key_values, use_cache, cache_position 等
             prefix_output = self.g2vlm.language_model.base_model.forward(
                 input_ids=None,
                 inputs_embeds=inputs_embeds[0],
@@ -572,7 +573,6 @@ class G2VLMWithActorExpertModel(nn.Module):
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
-                adarms_cond=adarms_cond[0],
             )
             prefix_past_key_values = prefix_output.past_key_values
             prefix_output = prefix_output.last_hidden_state
