@@ -237,7 +237,7 @@ def load_model_and_tokenizer(model_path, use_pretrained_g2vlm, device):
         model_state_dict_path = os.path.join(model_path, "model.safetensors")
         state_dict = load_file(model_state_dict_path, device="cpu")
         msg = model.load_state_dict(state_dict, strict=False)
-        print(msg)
+        logging.info("G2VLM load_state_dict: %s", msg)
         del state_dict
 
     # 🚨 3. 只在这里搬一次
@@ -389,15 +389,10 @@ class G2VLMWithActorExpertModel(nn.Module):
         Add 20250110: 返回 grid grid_thw 信息
         """
 
-        # --- 🚀 核心诊断：检查输入像素 ---
-        logging.info("Check the Image Input Infor")
-        
-        print(f"DEBUG [Image Raw]: dtype: {image.dtype}")
-        print(f"DEBUG [Image Raw]: shape: {image.shape}")
-        print(f"DEBUG [Image Raw]: min: {image.min().item():.4f}")
-        print(f"DEBUG [Image Raw]: max: {image.max().item():.4f}")
-        print(f"DEBUG [Image Raw]: mean: {image.mean().item():.4f}")
-        print("-" * 30)
+        logging.debug(
+            "Image Raw: dtype=%s shape=%s min=%s max=%s mean=%s",
+            image.dtype, image.shape, image.min().item(), image.max().item(), image.mean().item(),
+        )
 
         # --- 🚀 保命锁 1：防止全黑图片导致 NaN ---
         # 如果图像所有值都一样（方差为0），给它加一点点极其微小的噪声
@@ -416,7 +411,7 @@ class G2VLMWithActorExpertModel(nn.Module):
 
 
         vit_pixel_values, image_grid_thw = self.vit_image_transform(image)
-        print(f"DEBUG: vit_pixel_values max: {vit_pixel_values.abs().max()}")
+        logging.debug("vit_pixel_values max: %s", vit_pixel_values.abs().max())
         
         device = next(self.visiontower.parameters()).device
         dtype = next(self.visiontower.parameters()).dtype
@@ -432,7 +427,7 @@ class G2VLMWithActorExpertModel(nn.Module):
 
         # ---------- 2. 几何分支 (DINO) ----------
         dino_images = self.dino_transform(image)          # -> [B, C, H'', W'']
-        print(f"DEBUG [DINO]: input images max: {dino_images.abs().max().item():.4f}")
+        logging.debug("DINO input images max: %s", dino_images.abs().max().item())
 
         B, C, H, W = dino_images.shape
         patch_size = self.dinoTower.config.patch_size  # 例如 16
@@ -459,8 +454,7 @@ class G2VLMWithActorExpertModel(nn.Module):
 
         dino_out = self.dinoTower(dino_images, cu_seqlens, max_seqlen)
         if torch.isnan(dino_out).any():
-            print("❌ NaN detected inside dinoTower!")
-            # 尝试强制修复 (仅用于调试)
+            logging.warning("NaN detected inside dinoTower, replacing with 0")
             dino_out = torch.nan_to_num(dino_out, 0.0)
         # dino_feats = dino_out.last_hidden_state
 
@@ -468,7 +462,7 @@ class G2VLMWithActorExpertModel(nn.Module):
         # dino_feats = self.dinoTower(pixel_values=dino_images)        # [B, N_dino, dino_dim]
         geometric_tokens = self.dinoProjector(dino_out)            # [B, N_dino, D]
         if torch.isnan(geometric_tokens).any():
-            print("❌ NaN detected after dinoProjector!")
+            logging.warning("NaN detected after dinoProjector")
 
         # ---------- 3. 存储 grid 信息（用于构建 position_ids）----------
         # 注意：这里只存储单张图的 grid，如果是 batch，需要在调用处累积
@@ -509,10 +503,10 @@ class G2VLMWithActorExpertModel(nn.Module):
         geometric_tokens = image_embeds["geometric"]  # [B, Ng, D]
         text_embeds = self.embed_language_tokens(text_tokens)  # [B, T, D]
 
-        # --- 🚀 关键诊断：看看是谁带毒 ---
-        print(f"DEBUG: semantic_tokens max: {semantic_tokens.abs().max()}")
-        print(f"DEBUG: geometric_tokens max: {geometric_tokens.abs().max()}")
-        print(f"DEBUG: text_embeds max: {text_embeds.abs().max()}")
+        logging.debug(
+            "build_prefix: semantic max=%s geometric max=%s text max=%s",
+            semantic_tokens.abs().max(), geometric_tokens.abs().max(), text_embeds.abs().max(),
+        )
 
         prefix_embeds = torch.cat(
             [semantic_tokens, geometric_tokens, text_embeds],
@@ -568,11 +562,12 @@ class G2VLMWithActorExpertModel(nn.Module):
             adarms_cond = [None, None]
 
         # --------------------------------------------------
-        # Case 1: only prefix (encode / prefill)
+        # Case 1: only prefix (encode / prefill)，与 PI0 一致：用 prefix_embs 而非 input_ids
         # --------------------------------------------------
         if inputs_embeds[1] is None:
             prefix_output = self.g2vlm.language_model.base_model.forward(
-                input_ids=observation.tokenized_prompt,
+                input_ids=None,
+                inputs_embeds=inputs_embeds[0],
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
@@ -611,10 +606,9 @@ class G2VLMWithActorExpertModel(nn.Module):
 
             num_layers = models[0].config.num_hidden_layers
 
-            # debug
             for i, x in enumerate(inputs_embeds):
                 if x is not None:
-                    print(f"Expert {i} input max: {x.abs().max()}")
+                    logging.debug("Expert %s input max: %s", i, x.abs().max())
             
             # 确保 grid 列表已初始化（在 embed_prefix 中会被填充）
             if not hasattr(self, 'current_vit_grid'):
@@ -738,13 +732,13 @@ class G2VLMWithActorExpertModel(nn.Module):
                     input_shape = hidden_states.shape[:-1]
                     hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
 
-                    print(f"LayerNorm out max: {hidden_states.abs().max()}")
+                    logging.debug("LayerNorm out max: %s", hidden_states.abs().max())
 
                     q = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
                     k = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
                     v = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-                    print(f"Q proj max: {q.abs().max()}")
+                    logging.debug("Q proj max: %s", q.abs().max())
 
                     query_states.append(q)
                     key_states.append(k)
@@ -761,9 +755,10 @@ class G2VLMWithActorExpertModel(nn.Module):
                 key_states = torch.cat(key_states, dim=2)
                 value_states = torch.cat(value_states, dim=2)
 
-                print("Fixed Query Shape:", query_states.shape)
-                print("Fixed key_states Shape:", key_states.shape)
-                print("Fixed value_states Shape:", value_states.shape)
+                logging.debug(
+                    "Concat QKV shapes: Q=%s K=%s V=%s",
+                    query_states.shape, key_states.shape, value_states.shape,
+                )
 
 
                 # 1. 获取 3D 旋转频率
@@ -787,7 +782,7 @@ class G2VLMWithActorExpertModel(nn.Module):
                     # cos, sin 形状通常为 [3, B, L, head_dim // (某因子)] 
                     # 或者在最新版 HF 中直接返回拼接好的变换张量
                     cos, sin = rope_module(value_states, position_ids)
-                    print(f"Cos max: {cos.max()}, Sin max: {sin.max()}") # 👈 检查这里
+                    logging.debug("RoPE cos max=%s sin max=%s", cos.max(), sin.max())
 
 
                 # # 1. Handle M-RoPE 5D output (if it returns the 3-axis components)模型会丢失高度和宽度的空间坐标 
@@ -804,7 +799,7 @@ class G2VLMWithActorExpertModel(nn.Module):
                 #     cos = cos[:, :1, :, :]
                 #     sin = sin[:, :1, :, :]
 
-                print(f"Broadcast-ready Cos shape: {cos.shape}")
+                logging.debug("Broadcast-ready Cos shape: %s", cos.shape)
 
                 # 2. 应用 3D M-RoPE
                 query_states, key_states = apply_rotary_pos_emb_vision_3d(
@@ -818,7 +813,7 @@ class G2VLMWithActorExpertModel(nn.Module):
                 # query_states = q_embed
                 # key_states = k_embed
 
-                print(f"Q max: {query_states.max()}, K max: {key_states.max()}")
+                logging.debug("After RoPE Q max=%s K max=%s", query_states.max(), key_states.max())
 
                 # query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
                 #     query_states, key_states, cos, sin, unsqueeze_dim=1
@@ -832,10 +827,10 @@ class G2VLMWithActorExpertModel(nn.Module):
                     # head_dim 通常是 128 或 64
                     scaling = attn_module.head_dim ** -0.5
 
-                print(query_states.shape)
-                print(key_states.shape)
-                print(value_states.shape)
-                print(attention_mask.shape)
+                logging.debug(
+                    "Attention input Q=%s K=%s V=%s mask=%s",
+                    query_states.shape, key_states.shape, value_states.shape, attention_mask.shape,
+                )
 
                 # if query_states.dim() == 5:
                 #     # Qwen2-VL 的 apply_mrope 可能会保留 3D 维度。
@@ -868,7 +863,7 @@ class G2VLMWithActorExpertModel(nn.Module):
                 # key_states = key_states.reshape(batch_size, 2, seq_len, 128)
 
                 # 打印一下确认：应该是 [1, 12, 1059, 128] 和 [1, 2, 1059, 128]
-                print(f"Final Q: {query_states.shape}, K: {key_states.shape}")
+                logging.debug("Final Q: %s K: %s", query_states.shape, key_states.shape)
 
                 att_output, _ = modeling_gemma.eager_attention_forward(
                     models[0].base_model.layers[layer_idx].self_attn,

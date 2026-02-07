@@ -290,8 +290,7 @@ class OmniVLA(nn.Module):
         pad_masks = []
         att_masks = []
         
-        print(type(images), len(images))
-        print(images[0].shape, images[0].dtype, images[0].min(), images[0].max())
+        logging.debug("embed_prefix_old images: type=%s len=%s shape=%s", type(images), len(images), images[0].shape if images else None)
 
 
         # Process images
@@ -364,9 +363,7 @@ class OmniVLA(nn.Module):
             self.g2vlm_with_expert.current_vit_grid.append(img_emb_dict["vit_grid"])
             self.g2vlm_with_expert.current_dino_grid.append(img_emb_dict["dino_grid"])
 
-            # --- 🚀 诊断点 1：视觉分支 ---
-            print(f"DEBUG [Layer: Input]: semantic_tokens max: {semantic_tokens.abs().max().item():.4f}")
-            print(f"DEBUG [Layer: Input]: geometric_tokens max: {geometric_tokens.abs().max().item():.4f}")
+            logging.debug("embed_prefix semantic max=%s geometric max=%s", semantic_tokens.abs().max().item(), geometric_tokens.abs().max().item())
 
             # expand batch to match language tokens batch
             if semantic_tokens.size(0) != batch_size:
@@ -387,10 +384,8 @@ class OmniVLA(nn.Module):
 
         # Process language tokens
         lang_emb = self.g2vlm_with_expert.embed_language_tokens(lang_tokens)
-        # --- 🚀 诊断点 2：语言 Embedding ---
-        print(f"DEBUG [Layer: Input]: lang_emb (pre-scale) max: {lang_emb.abs().max().item():.4f}")
         lang_emb = lang_emb * math.sqrt(lang_emb.size(-1))
-        print(f"DEBUG [Layer: Input]: lang_emb (post-scale) max: {lang_emb.abs().max().item():.4f}")
+        logging.debug("embed_prefix lang_emb max=%s", lang_emb.abs().max().item())
 
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
@@ -518,10 +513,10 @@ class OmniVLA(nn.Module):
             'actual_prefix_len': prefix_embs.shape[1]  # 添加实际的 prefix 长度
         }
 
-        print(f"DEBUG: prefix_embs shape: {prefix_embs.shape}")
-        print(f"DEBUG: suffix_embs shape: {suffix_embs.shape}")
-        print(f"DEBUG: vit_grid count: {len(self.current_vit_grid)}")
-        print(f"DEBUG: dino_grid count: {len(self.current_dino_grid)}")
+        logging.debug(
+            "forward prefix_embs=%s suffix_embs=%s vit_grids=%s dino_grids=%s",
+            prefix_embs.shape, suffix_embs.shape, len(self.current_vit_grid), len(self.current_dino_grid),
+        )
         position_ids = self.build_3d_position_ids(prefix_info, suffix_embs.shape[1])
 
         # --- 🚀 核心修改点：混合因果掩码 ---
