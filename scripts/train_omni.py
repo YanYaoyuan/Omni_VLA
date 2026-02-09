@@ -638,6 +638,8 @@ def train_loop(config: _config.TrainConfig):
     g2_model_path = '/home/user/robot/model/G2VLM-2B-MoT'
     model = OmniVLA(config=model_cfg, device=device)
 
+    model = model.type(torch.bfloat16)
+
     enable_gradient_checkpointing = False
     model.gradient_checkpointing_disable()
 
@@ -678,15 +680,15 @@ def train_loop(config: _config.TrainConfig):
     # if g2vlm_weight_path is provided in the config
 
     # Optimizer + learning rate schedule from config
-    omni_warmup_steps = 1_000
-    omni_peak_lr = 5e-5
-    omni_decay_steps = 1_000_000
-    omni_decay_lr = 5e-5
+    # omni_warmup_steps = 1_000
+    # omni_peak_lr = 5e-5
+    # omni_decay_steps = 1_000_000
+    # omni_decay_lr = 5e-5
 
-    warmup_steps = omni_warmup_steps
-    peak_lr = omni_peak_lr
-    decay_steps = omni_decay_steps
-    end_lr = omni_decay_lr
+    warmup_steps = config.lr_schedule.warmup_steps
+    peak_lr = config.lr_schedule.peak_lr
+    decay_steps = config.lr_schedule.decay_steps
+    end_lr = config.lr_schedule.decay_lr
 
     # Create optimizer with config parameters
     optim = torch.optim.AdamW(

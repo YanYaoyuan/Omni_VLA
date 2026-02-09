@@ -61,6 +61,83 @@ Terminal window 2:
 uv run --no-sync scripts/serve_policy.py --env LIBERO
 ```
 
+## 使用本地 LIBERO 数据 + PyTorch 训练
+
+若希望用**本地的 LIBERO 数据集**在 openpi 里做 **PyTorch 微调**，按下面步骤操作。
+
+### 1. 准备原始 LIBERO 数据（RLDS 格式）
+
+原始数据来源二选一：
+
+- **从 HuggingFace 下载**： [openvla/modified_libero_rlds](https://huggingface.co/datasets/openvla/modified_libero_rlds)  
+  - 用 `tensorflow_datasets` 加载时会自动下载到 TFDS 缓存目录（如 `~/tensorflow_datasets`）。
+- **已有本地 RLDS 目录**：若已下载到某目录，记下该路径作为 `--data_dir`。
+
+### 2. 转换为 LeRobot 格式
+
+安装转换依赖：
+
+```bash
+uv pip install tensorflow tensorflow_datasets
+```
+
+（可选）若希望训练时用「本地 LeRobot 目录」而不是 HuggingFace Hub，在 `examples/libero/convert_libero_data_to_lerobot.py` 里把 `REPO_NAME` 改为本地用的名字，例如：
+
+```python
+REPO_NAME = "libero"  # 转换后的数据会放在 $HF_LEROBOT_HOME/libero
+```
+
+指定 **LeRobot 数据根目录** 并执行转换（`--data_dir` 为 TFDS 数据目录，不填则用默认缓存）：
+
+```bash
+export HF_LEROBOT_HOME=/path/to/your/lerobot/data   # 转换后的输出目录
+uv run --no-sync examples/libero/convert_libero_data_to_lerobot.py --data_dir /path/to/tfds/data
+```
+
+转换完成后，LeRobot 数据集位于：`$HF_LEROBOT_HOME/<REPO_NAME>`（例如 `$HF_LEROBOT_HOME/libero`）。
+
+### 3. 计算归一化统计量
+
+使用「本地 LIBERO」对应的训练配置（若你上面用了 `REPO_NAME="libero"`，则用 `pi05_libero_local`）：
+
+```bash
+export HF_LEROBOT_HOME=/path/to/your/lerobot/data
+uv run --no-sync scripts/compute_norm_stats.py --config-name pi05_libero_local
+```
+
+若你自定义了 `REPO_NAME`（例如 `my_name/libero`），需在 `src/openpi/training/config.py` 里新增或修改一个 `TrainConfig`，使其 `data.repo_id` 与 `REPO_NAME` 一致，再用该 config 名运行上述命令。
+
+### 4. PyTorch 训练
+
+保持同一 `HF_LEROBOT_HOME`，用对应 config 启动训练（单卡示例）：
+
+```bash
+export HF_LEROBOT_HOME=/path/to/your/lerobot/data
+uv run --no-sync scripts/train_pytorch.py pi05_libero_local --exp_name my_libero_run --save_interval 5000
+```
+
+多卡（例如 2 卡）：
+
+```bash
+export HF_LEROBOT_HOME=/path/to/your/lerobot/data
+torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi05_libero_local --exp_name my_libero_run --save_interval 5000
+```
+
+ checkpoint 会写在项目下的 `checkpoints/pi05_libero_local/my_libero_run/` 中（按 step 子目录保存）。
+
+### 5. 用命令行覆盖 `repo_id`（可选）
+
+若不想改 config 文件，也可以直接通过命令行覆盖数据源，例如使用已转换好的 `my_name/libero`：
+
+```bash
+export HF_LEROBOT_HOME=/path/to/your/lerobot/data
+uv run --no-sync scripts/train_pytorch.py pi05_libero --exp_name my_run --data.repo_id my_name/libero
+```
+
+此时仍需先用同一 `repo_id` 跑一遍 `compute_norm_stats.py`（例如 `--config-name pi05_libero` 并加上 `--data.repo_id my_name/libero`，若 tyro 支持该覆盖）。
+
+---
+
 ## Results
 
 If you want to reproduce the following numbers, you can evaluate the checkpoint at `gs://openpi-assets/checkpoints/pi05_libero/`. This

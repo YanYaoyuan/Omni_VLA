@@ -765,12 +765,12 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
-        TrainConfig(
-        name="omni_libero",
-        # model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
-        model=omni_config.OmniConfig(pi05=False, action_horizon=10, discrete_state_input=False),
+    # 使用本地 LIBERO（LeRobot 格式）训练：需先将数据转换并设置 HF_LEROBOT_HOME，见 examples/libero/README.md
+    TrainConfig(
+        name="pi05_libero_local",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
         data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
+            repo_id="libero",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
@@ -786,6 +786,28 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+        TrainConfig(
+        name="omni_libero",
+        # model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        model=omni_config.OmniConfig(pi05=False, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="droid",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=100_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        # w eight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        # pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=100_000,
     ),
     #
     # Fine-tuning Aloha configs.

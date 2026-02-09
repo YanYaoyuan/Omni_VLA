@@ -741,7 +741,7 @@ class G2VLMWithActorExpertModel(nn.Module):
 
                 for i, hidden_states in enumerate(inputs_embeds):
 
-                    layer = models[i].model.layers[layer_idx]
+                    layer = models[i].base_model.layers[layer_idx]
                     hidden_states = layer.input_layernorm(hidden_states)  # 不传 cond
                     # 创建全 1 gate，占位
                     gate = torch.full_like(hidden_states, 0.001)
@@ -891,7 +891,7 @@ class G2VLMWithActorExpertModel(nn.Module):
                 logging.debug("Final Q: %s K: %s", query_states.shape, key_states.shape)
 
                 att_output, _ = modeling_gemma.eager_attention_forward(
-                    models[0].model.layers[layer_idx].self_attn,
+                    models[0].base_model.layers[layer_idx].self_attn,
                     query_states,
                     key_states,
                     value_states,
@@ -899,14 +899,14 @@ class G2VLMWithActorExpertModel(nn.Module):
                     scaling,
                 )
 
-                head_dim = models[0].model.layers[layer_idx].self_attn.head_dim
-                num_heads = models[0].model.layers[layer_idx].self_attn.num_heads
+                head_dim = models[0].base_model.layers[layer_idx].self_attn.head_dim
+                num_heads = models[0].base_model.layers[layer_idx].self_attn.num_heads
                 att_output = att_output.reshape(att_output.shape[0], -1, num_heads * head_dim)
 
                 outputs = []
                 start = 0
                 for i, hidden_states in enumerate(inputs_embeds):
-                    layer = models[i].model.layers[layer_idx]
+                    layer = models[i].base_model.layers[layer_idx]
                     expert_dtype = layer.mlp.gate_proj.weight.dtype
 
                     end = start + hidden_states.shape[1]
@@ -951,7 +951,7 @@ class G2VLMWithActorExpertModel(nn.Module):
             # final norm
             outputs = []
             for i, hidden_states in enumerate(inputs_embeds):
-                out = models[i].model.norm(hidden_states)
+                out = models[i].base_model.norm(hidden_states)
                 outputs.append(out)
 
             prefix_output, suffix_output = outputs

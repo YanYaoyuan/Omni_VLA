@@ -147,6 +147,9 @@ class OmniVLA(nn.Module):
         for param in self.g2vlm_with_expert.g2vlm.vit_model.parameters():
             param.requires_grad = False
 
+        for param in self.g2vlm_with_expert.g2vlm.dino_model.parameters():
+            param.requires_grad = False
+
         for param in self.g2vlm_with_expert.g2vlm.language_model.parameters():
             param.requires_grad = False
 
@@ -692,6 +695,13 @@ class OmniVLA(nn.Module):
         
         # 4. 拼接文本和动作 (Suffix)
         total_incremental_len = text_len + suffix_len
+
+        if total_incremental_len <= 0:
+            import os
+            print(f"[Rank {os.environ.get('RANK')}] ERROR: total_incremental_len is {total_incremental_len}! curr_pos_val: {curr_pos_val}")
+            # 临时给个 0 长度防止崩溃，观察是否能继续跑出更多 log
+            total_incremental_len = 0
+
         incremental_ids = torch.arange(curr_pos_val, curr_pos_val + total_incremental_len, device=device)
         text_act_pos = incremental_ids.unsqueeze(0).unsqueeze(0).repeat(3, b, 1)
 

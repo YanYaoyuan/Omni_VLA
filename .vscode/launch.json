@@ -8,7 +8,7 @@
     "python": "/home/user/robot/openpi/.venv/bin/python",
     "program": "${workspaceFolder}/scripts/train_omni.py",
     "args": [
-        "pi0_libero_low_mem_finetune",
+        "omni_libero",
         "--exp_name",
         "pytorch_test"
     ],
