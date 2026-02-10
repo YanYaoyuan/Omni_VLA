@@ -673,7 +673,7 @@ _CONFIGS = [
         ),
         # Here you define which pre-trained checkpoint you want to load to initialize the model.
         # This should match the model config you chose above -- i.e. in this case we use the pi0 base model.
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_libero/params"),
         # Below you can define other hyperparameters like the learning rate, number of training steps, etc.
         # Check the base TrainConfig class for a full list of available hyperparameters.
         num_train_steps=30_000,
@@ -683,12 +683,12 @@ _CONFIGS = [
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
         model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
+            repo_id="libero",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=30_000,
+        num_train_steps=60_000,
         batch_size=4,
         # The freeze filter defines which parameters should be frozen during training.
         # We have a convenience function in the model config that returns the default freeze filter
@@ -771,7 +771,7 @@ _CONFIGS = [
         # model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
         model=omni_config.OmniConfig(pi05=False),
         data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
+            repo_id="libero",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=True,
         ),
@@ -781,11 +781,11 @@ _CONFIGS = [
             decay_steps=100_000,
             decay_lr=5e-5,
         ),
-        batch_size=8,
+        batch_size=2,
         ema_decay=None,
         save_interval=10000,
         # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        pytorch_weight_path="/data/base_model/pi0_torch_base/",
         num_train_steps=100_000,
         # action_horizon=10,
     ),

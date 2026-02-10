@@ -15,7 +15,7 @@
     "env": {
       "PYTHONPATH": "${workspaceFolder}",
       "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.9",
-      "CUDA_VISIBLE_DEVICES": "1",
+      "CUDA_VISIBLE_DEVICES": "0",
       "TF_CPP_MIN_LOG_LEVEL": "0",
       "TF_ENABLE_ONEDNN_OPTS": "0"
     },

@@ -16,7 +16,7 @@ from openpi.vlm_expert.dinov2_with_registers.modular_dinov2_with_registers impor
 
 import os
 
-MODEL_PATH = "/data/base_model/pi0_base_torch/model.safetensors"
+MODEL_PATH = "/data/base_model/pi0_torch_base/model.safetensors"
 
 VGGT_PRETRAINED_PATH = "/data/base_model/VGGT-1B/model.safetensors"
 
@@ -144,12 +144,13 @@ class VLMWithSpatialActionExpertModel(
     "VLM model with spatial expert with acthion expert"
     def __init__(
         self,
-        reasoning_expert_config,
+        vlm_config,
         spatial_expert_config,
         action_expert_config,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
     ):
         super().__init__()
+        reasoning_expert_config = vlm_config
 
         vlm_config_hf = CONFIG_MAPPING["paligemma"]()
         vlm_config_hf._vocab_size = 257152  # noqa: SLF001
@@ -193,6 +194,9 @@ class VLMWithSpatialActionExpertModel(
             if k.startswith("paligemma_with_expert.gemma_expert.")
         }
 
+        print(self.reasoning_expert)
+
+        print(self.reasoning_expert.state_dict().keys())
 
         missing_keys, unexpected_keys = self.reasoning_expert.load_state_dict(
             paligemma_state,

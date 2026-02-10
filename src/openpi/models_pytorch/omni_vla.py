@@ -239,15 +239,15 @@ class OmniVLA(nn.Module):
     def train(self, mode: bool = True):
         super().train(mode)
 
-        if self.config.freeze_vision_encoder:
-            self.reasoning_spatial_expert.reasoning_expert.vision_tower.eval()
+        # if self.config.freeze_vision_encoder:
+        #     self.reasoning_spatial_expert.reasoning_expert.vision_tower.eval()
 
-        if self.config.train_expert_only:
-            self.reasoning_spatial_expert.reasoning_expert.eval()
-            self.reasoning_spatial_expert.spatial_expert.eval()
+        # if self.config.train_expert_only:
+        #     self.reasoning_spatial_expert.reasoning_expert.eval()
+        #     self.reasoning_spatial_expert.spatial_expert.eval()
 
-        if self.config.freeze_VGGT_model:
-            self.reasoning_spatial_expert.vggt_encoder.eval()
+        # if self.config.freeze_VGGT_model:
+        #     self.reasoning_spatial_expert.vggt_encoder.eval()
         
         return self
     
