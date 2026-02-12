@@ -354,12 +354,17 @@ class OmniVLA(nn.Module):
         """
         # 1. 准备图像张量 [B, S, C, H, W]
         images_tensor = torch.stack(images, dim=1)
-        images_tensor = images_tensor.to(
-            dtype=next(self.reasoning_spatial_expert.vggt_encoder.parameters()).dtype
-        )
         B, S, C, H, W = images_tensor.shape
 
-        # 2. VGGT 特征提取
+        # 2. VGGT 专用预处理：resize 到 256x256，归一化到 [-1, 1]
+        # 参考 prepare_spatial_features 和 InternVLA_A1_3B get_cosmos_features
+        vggt_dtype = next(self.reasoning_spatial_expert.vggt_encoder.parameters()).dtype
+        images_flat = images_tensor.view(B * S, C, H, W)
+        images_flat = F.interpolate(images_flat, size=(256, 256), mode="bilinear", align_corners=False)
+        images_flat = images_flat * 2 - 1  # [0,1] → [-1,1]
+        images_tensor = images_flat.view(B, S, C, 256, 256).to(dtype=vggt_dtype)
+
+        # 3. VGGT 特征提取
         def image_embed_func(img):
             # 输入 [B, S, C, H, W]，返回字典，其中 features[-1] 是最后一层特征
             # 形状通常为 [B, S, N, D]，其中 N 是 token 数量（含 patch + global tokens）
@@ -396,9 +401,14 @@ class OmniVLA(nn.Module):
         img_emb = img_emb.view(B, S * N, D)
         pad_masks = pad_masks.view(B, S * N)
         
-        # 5. 构建 attention mask (Gemma 风格通常 0 表示不屏蔽，具体看 make_att_2d_masks 实现)
-        # 这里保持与你原始代码逻辑一致，全 0
-        att_masks = torch.zeros_like(pad_masks, dtype=torch.bool)
+        # 5. 构建 attention mask
+        # 第一个 token 置 1 建立 causal boundary，使 prefix 无法 attend 到 middle，
+        # 但 middle 可以 attend 到 prefix。这样推理时先处理 prefix（不含 middle 信息）
+        # 与训练行为一致，消除训练-推理 gap。
+        # 参考 InternVLA_A1_3B embed_middle: att_masks = [1] + [0] * (seq_len - 1)
+        seq_len = pad_masks.shape[1]
+        att_masks = torch.zeros((B, seq_len), dtype=torch.bool, device=device)
+        att_masks[:, 0] = True  # 第一个 token 置 1，建立 causal boundary
 
         # 6. 维度映射到推理模型维度 (如 1024 或 2048)
         img_emb = self.spatial_to_reasoning(img_emb)
@@ -684,7 +694,7 @@ class OmniVLA(nn.Module):
         # 索引 1 对应 spatial_expert（reasoning=0, spatial=1, action=2）
         middle_position_ids_2d = torch.arange(1, middle_len + 1, dtype=torch.long, device=device)
         middle_position_ids_2d = middle_position_ids_2d.unsqueeze(0).expand(batch_size, -1)  # [batch_size, middle_len]
-        middle_position_ids_2d = middle_position_ids_2d + max_prefix_position_ids.squeeze(-1)  # [batch_size, middle_len]
+        middle_position_ids_2d = middle_position_ids_2d + max_prefix_position_ids  # [batch_size, 1] broadcasts to [batch_size, middle_len]
 
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
 
@@ -773,7 +783,7 @@ class OmniVLA(nn.Module):
         device = suffix_embs.device
         position_ids = torch.arange(1, suffix_len + 1, dtype=torch.long, device=device)
         position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)  # [batch_size, suffix_len]
-        position_ids = position_ids + max_position_ids.squeeze(-1)  # [batch_size, suffix_len]
+        position_ids = position_ids + max_position_ids  # [batch_size, 1] broadcasts to [batch_size, suffix_len]
 
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
 

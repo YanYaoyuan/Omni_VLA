@@ -75,7 +75,7 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
     ),
     EnvMode.LIBERO: Checkpoint(
         config="omni_libero",
-        dir="/data/openpi_temp/checkpoints/omni_libero/ddp_test_12/30000",
+        dir="/data/openpi_temp/checkpoints/omni_libero/ddp_omni_libero_train/60000",
     ),
 }
 
