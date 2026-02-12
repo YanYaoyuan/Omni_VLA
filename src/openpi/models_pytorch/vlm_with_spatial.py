@@ -16,7 +16,7 @@ from openpi.vlm_expert.dinov2_with_registers.modular_dinov2_with_registers impor
 
 import os
 
-MODEL_PATH = "/data/base_model/pi0_torch_base/model.safetensors"
+MODEL_PATH = "/data/base_model/pi0_torch_libero/model.safetensors"
 
 VGGT_PRETRAINED_PATH = "/data/base_model/VGGT-1B/model.safetensors"
 
@@ -182,7 +182,7 @@ class VLMWithSpatialActionExpertModel(
         for k in vlm_keys:
             print(k)
 
-        paligemma_state = {
+        paligemma_state_raw = {
             k.replace("paligemma_with_expert.paligemma.", "", 1): v
             for k, v in state_dict.items()
             if k.startswith("paligemma_with_expert.paligemma.")
@@ -194,18 +194,40 @@ class VLMWithSpatialActionExpertModel(
             if k.startswith("paligemma_with_expert.gemma_expert.")
         }
 
-        print(self.reasoning_expert)
+        # checkpoint 用的自定义 transformers，key 层级与标准 HF 不同，需要做映射：
+        #   checkpoint:  model.language_model.layers.X.xxx  →  HF:  language_model.model.layers.X.xxx
+        #   checkpoint:  model.vision_tower.xxx             →  HF:  vision_tower.xxx
+        #   checkpoint:  model.multi_modal_projector.xxx    →  HF:  multi_modal_projector.xxx
+        #   checkpoint:  lm_head.weight                     →  HF:  language_model.lm_head.weight
+        def _remap_paligemma_key(key: str) -> str:
+            if key.startswith("model.language_model."):
+                # model.language_model.layers.X.xxx -> language_model.model.layers.X.xxx
+                return "language_model.model." + key[len("model.language_model."):]
+            elif key.startswith("model.vision_tower."):
+                # model.vision_tower.xxx -> vision_tower.xxx
+                return key[len("model."):]
+            elif key.startswith("model.multi_modal_projector."):
+                # model.multi_modal_projector.xxx -> multi_modal_projector.xxx
+                return key[len("model."):]
+            elif key == "lm_head.weight":
+                return "language_model.lm_head.weight"
+            elif key.startswith("model."):
+                # 其他 model.xxx 的兜底处理
+                return key[len("model."):]
+            return key
 
-        print(self.reasoning_expert.state_dict().keys())
+        paligemma_state = {
+            _remap_paligemma_key(k): v for k, v in paligemma_state_raw.items()
+        }
 
         missing_keys, unexpected_keys = self.reasoning_expert.load_state_dict(
             paligemma_state,
-            strict=False    # 或 False，见下面说明
+            strict=False
         )
 
         print(f"Loaded reasoning_expert: {len(paligemma_state)} params")
-        print("Missing keys (first 20):", missing_keys[:20])
-        print("Unexpected keys (first 20):", unexpected_keys[:20])
+        print("Missing keys:", missing_keys[:20])
+        print("Unexpected keys:", unexpected_keys[:20])
 
 
         "Spatial expert config"
