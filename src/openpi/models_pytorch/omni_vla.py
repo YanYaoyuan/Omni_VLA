@@ -360,9 +360,9 @@ class OmniVLA(nn.Module):
         # 参考 prepare_spatial_features 和 InternVLA_A1_3B get_cosmos_features
         vggt_dtype = next(self.reasoning_spatial_expert.vggt_encoder.parameters()).dtype
         images_flat = images_tensor.view(B * S, C, H, W)
-        images_flat = F.interpolate(images_flat, size=(256, 256), mode="bilinear", align_corners=False)
+        images_flat = F.interpolate(images_flat, size=(252, 252), mode="bilinear", align_corners=False)
         images_flat = images_flat * 2 - 1  # [0,1] → [-1,1]
-        images_tensor = images_flat.view(B, S, C, 256, 256).to(dtype=vggt_dtype)
+        images_tensor = images_flat.view(B, S, C, 252, 252).to(dtype=vggt_dtype)
 
         # 3. VGGT 特征提取
         def image_embed_func(img):
