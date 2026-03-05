@@ -501,7 +501,7 @@ class TrainConfig:
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
     # Base directory for checkpoints.
-    checkpoint_base_dir: str = "/data/openpi_temp/checkpoints"
+    checkpoint_base_dir: str = "/root/autodl-tmp/checkpoints"
 
     # Random seed that will be used by random generators during training.
     seed: int = 42
@@ -683,7 +683,7 @@ _CONFIGS = [
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
         model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotLiberoDataConfig(
-            repo_id="libero",
+            repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=True,
         ),
@@ -771,21 +771,21 @@ _CONFIGS = [
         # model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
         model=omni_config.OmniConfig(pi05=False),
         data=LeRobotLiberoDataConfig(
-            repo_id="libero",
+            repo_id="libero_lerobot",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=True,
         ),
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
+            warmup_steps=2_000,
             peak_lr=5e-5,
             decay_steps=100_000,
-            decay_lr=5e-5,
+            decay_lr=5e-6,
         ),
-        batch_size=2,
+        batch_size=32,
         ema_decay=None,
         save_interval=10000,
         # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/data/base_model/pi0_torch_base/",
+        pytorch_weight_path="/root/autodl-tmp/checkpoints/omni_libero/ddp_omni_libero_train_fail/40000",
         num_train_steps=100_000,
         # action_horizon=10,
     ),

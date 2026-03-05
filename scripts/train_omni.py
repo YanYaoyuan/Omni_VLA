@@ -640,21 +640,19 @@ def train_loop(config: _config.TrainConfig):
 
     model = model.to(device)
 
-    enable_gradient_checkpointing = False
-    model.gradient_checkpointing_disable()
 
     for n, p in model.named_parameters():
         if p.requires_grad:
             print(n)
 
 
-    # if hasattr(model, "gradient_checkpointing_enable"):
-    #     enable_gradient_checkpointing = True
-    #     model.gradient_checkpointing_enable()
-    #     logging.info("Enabled gradient checkpointing for memory optimization")
-    # else:
-    #     enable_gradient_checkpointing = False
-    #     logging.info("Gradient checkpointing is not supported for this model")
+    if hasattr(model, "gradient_checkpointing_enable"):
+        enable_gradient_checkpointing = True
+        model.gradient_checkpointing_enable()
+        logging.info("Enabled gradient checkpointing for memory optimization")
+    else:
+        enable_gradient_checkpointing = False
+        logging.info("Gradient checkpointing is not supported for this model")
 
     # Log initial memory usage after model creation
     if is_main and torch.cuda.is_available():

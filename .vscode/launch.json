@@ -5,10 +5,10 @@
     "name": "Python: openpi train_test.py (FIXED)",
     "type": "python",
     "request": "launch",
-    "python": "/home/user/robot/openpi/.venv/bin/python",
+    "python": "/root/robot/Omni_VLA/.venv/bin/python",
     "program": "${workspaceFolder}/scripts/train_omni.py",
     "args": [
-        "pi0_libero_low_mem_finetune",
+        "omni_libero",
         "--exp_name",
         "pytorch_test"
     ],
@@ -27,7 +27,7 @@
     "name": "Python: OmniVLA_Evalu",
     "type": "python",
     "request": "launch",
-    "python": "/home/user/robot/openpi/.venv/bin/python",
+    "python": "/root/robot/Omni_VLA/.venv/bin/python",
     "program": "${workspaceFolder}/scripts/serve_policy.py",
     "args": [
         "--env",
@@ -36,7 +36,7 @@
     "env": {
       "PYTHONPATH": "${workspaceFolder}",
       "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.9",
-      "CUDA_VISIBLE_DEVICES": "1",
+      "CUDA_VISIBLE_DEVICES": "0",
       "TF_CPP_MIN_LOG_LEVEL": "0",
       "TF_ENABLE_ONEDNN_OPTS": "0",
       "TORCHDYNAMO_DISABLE": "1"
