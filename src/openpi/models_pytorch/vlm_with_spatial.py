@@ -46,7 +46,7 @@ def compute_layer_complete(
     #     key_states.append(key_state)
     #     value_states.append(value_state)
     for i, hidden_states in enumerate(inputs_embeds):
-        # 所有 models 都是 GemmaForCausalLM，需要 .model.layers
+        # All models are GemmaForCausalLM, require .model.layers
         layer = models[i].model.layers[layer_idx]
         hidden_states = layer.input_layernorm(hidden_states)  # noqa: PLW2901
 
@@ -64,12 +64,12 @@ def compute_layer_complete(
     key_states = torch.cat(key_states, dim=2)
     value_states = torch.cat(value_states, dim=2)
     
-    # reasoning_expert.language_model 是 GemmaForCausalLM，需要 .model.rotary_emb
+    # reasoning_expert.language_model is GemmaForCausalLM, requires .model.rotary_emb
     cos, sin = reasoning_expert.language_model.model.rotary_emb(query_states, position_ids)
 
     # seq_len = query_states.shape[2]
 
-    # # 如何生成1650长度？？？
+    # # How to generate 1650 length???
     # max_rotary_len = 1635
     # query_states = query_states[:, :, :max_rotary_len, :]
     # key_states   = key_states[:, :, :max_rotary_len, :]
@@ -88,7 +88,7 @@ def compute_layer_complete(
     # cos, sin = reasoning_expert.language_model.model.rotary_emb(dummy_tensor, position_ids)
     # cos, sin = reasoning_expert.get_rotary_embedding(seq_len)
 
-    # ⚠ 确保长度对齐 Q/K
+    # ⚠ Ensure length aligns with Q/K
     # cos = cos[:, :seq_len, :]
     # sin = sin[:, :seq_len, :]
     
@@ -96,7 +96,7 @@ def compute_layer_complete(
         query_states, key_states, cos, sin, unsqueeze_dim=1
     )
     batch_size = query_states.shape[0]
-    # reasoning_expert.language_model 是 GemmaForCausalLM，需要 .model.layers
+    # reasoning_expert.language_model is GemmaForCausalLM, requires .model.layers
     scaling = reasoning_expert.language_model.model.layers[layer_idx].self_attn.scaling
     # Attention computation
     att_output, _ = modeling_gemma.eager_attention_forward(
@@ -115,14 +115,14 @@ def compute_layer_complete(
     outputs_embeds = []
     start_pos = 0
     for i, hidden_states in enumerate(inputs_embeds):
-        # 所有 models 都是 GemmaForCausalLM，需要 .model.layers
+        # All models are GemmaForCausalLM, require .model.layers
         layer = models[i].model.layers[layer_idx]
         end_pos = start_pos + hidden_states.shape[1]
         if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
             att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
         out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
         # first residual
-        residual_len = out_emb.shape[1]  # 当前 att_output 对应长度
+        residual_len = out_emb.shape[1]  # Corresponding length of current att_output
         hidden_states = hidden_states[:, :residual_len, :]
         out_emb = out_emb + hidden_states
         after_first_residual = out_emb.clone()
@@ -172,10 +172,10 @@ class VLMWithSpatialActionExpertModel(
 
         self.reasoning_expert = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
 
-        # 2. 加载本地权重
+        # 2. Load local weights
         state_dict = load_file(MODEL_PATH, device = "cpu")
 
-        # 全量搜索所有 key 中是否包含 VLM
+        # Full search of all keys to see if they contain VLM
         vlm_keys = [k for k in state_dict.keys() if "paligemma_with_expert.paligemma" in k]
 
         print(f"Found {len(vlm_keys)} keys for reasoning_expert:")
@@ -194,7 +194,7 @@ class VLMWithSpatialActionExpertModel(
             if k.startswith("paligemma_with_expert.gemma_expert.")
         }
 
-        # checkpoint 用的自定义 transformers，key 层级与标准 HF 不同，需要做映射：
+        # Checkpoint uses custom transformers, key hierarchy is different from standard HF, mapping is needed:
         #   checkpoint:  model.language_model.layers.X.xxx  →  HF:  language_model.model.layers.X.xxx
         #   checkpoint:  model.vision_tower.xxx             →  HF:  vision_tower.xxx
         #   checkpoint:  model.multi_modal_projector.xxx    →  HF:  multi_modal_projector.xxx
@@ -212,7 +212,7 @@ class VLMWithSpatialActionExpertModel(
             elif key == "lm_head.weight":
                 return "language_model.lm_head.weight"
             elif key.startswith("model."):
-                # 其他 model.xxx 的兜底处理
+                # Fallback processing for other model.xxx
                 return key[len("model."):]
             return key
 
@@ -363,7 +363,7 @@ class VLMWithSpatialActionExpertModel(
             models = [self.reasoning_expert.language_model, self.spatial_expert, self.action_expert]
             num_layers = self.reasoning_expert.config.text_config.num_hidden_layers
 
-            # Check if gradient checkpointing is enabled (flag 在 omni_vla 里设到 .model 上，与 g2vlm_pi0 一致)
+            # Check if gradient checkpointing is enabled (flag is set to .model in omni_vla, consistent with g2vlm_pi0)
             use_gradient_checkpointing = (
                 getattr(self.reasoning_expert.language_model, "gradient_checkpointing", False)
                 and getattr(self.spatial_expert.model, "gradient_checkpointing", False)
@@ -401,7 +401,7 @@ class VLMWithSpatialActionExpertModel(
             def compute_final_norms(inputs_embeds):
                 outputs_embeds = []
                 for i, hidden_states in enumerate(inputs_embeds):
-                    # 所有 models 都是 GemmaForCausalLM，需要 .model.norm
+                    # All models are GemmaForCausalLM, require .model.norm
                     out_emb = models[i].model.norm(hidden_states)
                     outputs_embeds.append(out_emb)
                 return outputs_embeds

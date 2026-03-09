@@ -15,23 +15,23 @@ class OmniConfig(_pi0_config.Pi0Config):
     # ------------------------------------------------------------------
     # G2VLM
     # ------------------------------------------------------------------
-    g2vlm_path: str = ""  # checkpoint 或 HF repo
+    g2vlm_path: str = ""  # checkpoint or HF repo
 
     # ------------------------------------------------------------------
-    # 基础模型配置（覆盖 Pi0）
+    # Base model config (overrides Pi0)
     # ------------------------------------------------------------------
     dtype: str = "bfloat16"
     action_expert_variant: str = "gemma_300m"
 
 
     use_pretrained_g2vlm: bool = False
-    pretrained_g2vlm_path : str = '/data/openpi_temp/checkpoints/pi0_libero_low_mem_finetune/omni_9/30000'  # checkpoint 或 HF repo
-    g2vlm_config_path : str = "/home/user/robot/model/G2VLM-2B-MoT"  # checkpoint 或 HF repo
+    pretrained_g2vlm_path : str = '/data/openpi_temp/checkpoints/pi0_libero_low_mem_finetune/omni_9/30000'  # checkpoint or HF repo
+    g2vlm_config_path : str = "/home/user/robot/model/G2VLM-2B-MoT"  # checkpoint or HF repo
 
     action_dim: int = 32
     action_horizon: int = 50
 
-    # PI0 / PI05 行为
+    # PI0 / PI05 behavior
     pi05: bool = False
 
     freeze_vision_encoder : bool = True
@@ -40,9 +40,9 @@ class OmniConfig(_pi0_config.Pi0Config):
     train_expert_only : bool = False
 
     # ------------------------------------------------------------------
-    # 训练 / 冻结策略
+    # Training / Freezing Strategy
     # ------------------------------------------------------------------
-    # 这些是「参数名路径前缀」，供 PyTorch 使用
+    # These are parameter name prefixes for PyTorch
     frozen_patterns: tuple[str, ...] = (
         "g2vlm.dino_model",
         "g2vlm.vit_model",
@@ -52,11 +52,11 @@ class OmniConfig(_pi0_config.Pi0Config):
         "g2vlm.global_points_decoder",
     )
 
-    # JAX / 自动化脚本参考
+    # JAX / Automation script reference
     use_lora: bool = False
 
     # ------------------------------------------------------------------
-    # 自动推导 token 长度
+    # Automatically infer token length
     # ------------------------------------------------------------------
     def __post_init__(self):
         if self.max_token_len is None:
@@ -67,23 +67,23 @@ class OmniConfig(_pi0_config.Pi0Config):
             )
 
     # ------------------------------------------------------------------
-    # Model type（⚠️ 不能复用 PI0 / PI05）
+    # Model type（⚠️ cannot reuse PI0 / PI05）
     # ------------------------------------------------------------------
     @property
     @override
     def model_type(self) -> _model.ModelType:
-        # 如果你愿意，后续可以在 ModelType 里正式加一个 OMNI
-        return "OMNI_VLA"  # PyTorch 路径不会用 enum
+        # If you want, you can officially add an OMNI in ModelType later
+        return "OMNI_VLA"  # PyTorch path won't use enum
 
     # ------------------------------------------------------------------
-    # PyTorch 实例化入口（核心）
+    # PyTorch instantiation entrypoint (core)
     # ------------------------------------------------------------------
     def get_pytorch_model(
         self,
         g2vlm_instance_path: Optional[str] = None,
     ):
         """
-        用于 serve_policy / train_policy
+        Used for serve_policy / train_policy
         """
         from openpi.models_pytorch.omni_vla import OmniVLA
 
@@ -98,16 +98,16 @@ class OmniConfig(_pi0_config.Pi0Config):
     
     @property
     def model_type(self):
-        return _model.ModelType.PI0  # 或 PI05
+        return _model.ModelType.PI0  # or PI05
 
     # ------------------------------------------------------------------
-    # 冻结规则（PyTorch 友好）
+    # Freeze rules (PyTorch friendly)
     # ------------------------------------------------------------------
     @override
     def get_freeze_filter(self) -> list[str]:
         """
-        返回需要被冻结的参数路径前缀。
-        PyTorch 脚本可直接：
+        Returns parameter path prefixes to be frozen.
+        PyTorch script can directly use:
             if name.startswith(prefix): param.requires_grad = False
         """
         return list(self.frozen_patterns)

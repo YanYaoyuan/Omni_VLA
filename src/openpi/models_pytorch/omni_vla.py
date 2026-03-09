@@ -48,7 +48,7 @@ def _debug_tensor(name, x, max_print=5):
         f"dtype={x.dtype}, "
         f"device={x.device}"
     )
-    # 只打印前面一點點，避免刷屏
+    # Only print the beginning to avoid cluttering
     print(f"{name} sample:", x.flatten()[:max_print].tolist())
     print("-" * 60)
 
@@ -177,25 +177,25 @@ class OmniVLA(nn.Module):
             action_expert_config.width, action_expert_config.width
         )
 
-        # 推理阶段先保持逻辑正确，不再对 bound method 做 torch.compile 包装，
-        # 否则会导致绑定关系丢失（出现 “missing 1 required positional argument: 'self'” 报错）。
+        # In the inference phase, keep the logic correct and no longer wrap bound methods with torch.compile,
+        # otherwise it will lead to lost binding relationships.
         torch.set_float32_matmul_precision("high")
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
-        # 硬编码冻结
+        # Hardcoded freeze
         for param in self.reasoning_spatial_expert.vggt_encoder.parameters():
             param.requires_grad = False
 
-        # 冻结VLM
+        # Freeze VLM
         # for param in self.reasoning_spatial_expert.reasoning_expert.parameters():
         #     param.requires_grad = False
 
         for param in self.reasoning_spatial_expert.reasoning_expert.vision_tower.parameters():
             param.requires_grad = False
 
-        # 冻结spatial
+        # Freeze spatial
         # for param in self.reasoning_spatial_expert.spatial_expert.parameters():
         #     param.requires_grad = False
 
@@ -210,7 +210,7 @@ class OmniVLA(nn.Module):
         
 
     def set_requires_grad(self):
-        """按 config 设置各 expert 的 requires_grad（与当前三专家 MOT 结构一致）。"""
+        """Set requires_grad for each expert according to config."""
         if getattr(self.config, "freeze_vision_encoder", False):
             self.reasoning_spatial_expert.reasoning_expert.vision_tower.eval()
             for p in self.reasoning_spatial_expert.reasoning_expert.vision_tower.parameters():
@@ -350,68 +350,68 @@ class OmniVLA(nn.Module):
     
     def embed_spatial(self, images, img_masks):
         """
-        Embed spatial images，确保 Mask 长度与 VGGT 输出的 Token 数量严格对齐。
+        Embed spatial images, ensuring the Mask length is strictly aligned with the number of VGGT output tokens.
         """
-        # 1. 准备图像张量 [B, S, C, H, W]
+        # 1. Prepare image tensor [B, S, C, H, W]
         images_tensor = torch.stack(images, dim=1)
         B, S, C, H, W = images_tensor.shape
 
-        # 2. VGGT 专用预处理：resize 到 256x256，归一化到 [-1, 1]
-        # 参考 prepare_spatial_features 和 InternVLA_A1_3B get_cosmos_features
+        # 2. VGGT specific preprocessing: resize to 256x256, normalize to [-1, 1]
+        # Reference prepare_spatial_features
         vggt_dtype = next(self.reasoning_spatial_expert.vggt_encoder.parameters()).dtype
         images_flat = images_tensor.reshape(B * S, C, H, W)
         images_flat = F.interpolate(images_flat, size=(252, 252), mode="bilinear", align_corners=False)
-        images_flat = images_flat * 2 - 1  # [0,1] → [-1,1]
+        images_flat = images_flat * 2 - 1  # [0,1] -> [-1,1]
         images_tensor = images_flat.reshape(B, S, C, 252, 252).to(dtype=vggt_dtype)
 
-        # 3. VGGT 特征提取
+        # 3. VGGT feature extraction
         def image_embed_func(img):
-            # 输入 [B, S, C, H, W]，返回字典，其中 features[-1] 是最后一层特征
-            # 形状通常为 [B, S, N, D]，其中 N 是 token 数量（含 patch + global tokens）
+            # Input [B, S, C, H, W], returns dict where features[-1] is the last layer features
+            # Shape is usually [B, S, N, D], where N is the number of tokens
             res = self.reasoning_spatial_expert.vggt_encoder(img)
             return res["features"][-1]
 
         with torch.no_grad():
             img_emb = image_embed_func(images_tensor) # [B, S, N, D]
         
-        # 获取实际的 Token 数量 N
+        # Get the actual number of Tokens N
         B, S, N, D = img_emb.shape
         device = img_emb.device
 
-        # 3. 动态构建 Mask
-        # 逻辑：VGGT 输出的 N 个 token 中，前一部分通常是 Patch，后一部分是 Global
-        # 为了严谨，我们直接根据 img_emb 的实际形状 [B, S*N] 生成全 1 的 Mask
-        # 如果后续需要对图像区域做精细化 Padding，建议在此处根据 N 的构成进行切片处理
+        # 3. Dynamically build Mask
+        # Logic: In the N tokens output by VGGT, the first part is usually Patch, and the latter is Global
+        # To be rigorous, we directly generate an all-1 Mask based on the actual shape of img_emb [B, S*N]
+        # If fine-grained padding is needed for image regions later, it is recommended to slice here based on N
         
-        # 生成与 img_emb 长度完全一致的 pad_masks [B, S*N]
-        # 我们先生成 [B, S, N] 再 view 成 [B, S*N] 以保持维度语义清晰
+        # Generate pad_masks [B, S*N] that are completely consistent with the length of img_emb
+        # We first generate [B, S, N] and then view it as [B, S*N] to keep the dimensional semantics clear
         pad_masks = torch.ones((B, S, N), dtype=torch.bool, device=device)
         
-        # 如果原始 img_masks (针对图片的 batch padding) 需要生效：
+        # If original img_masks (for batch padding of images) need to take effect:
         if img_masks is not None:
             if isinstance(img_masks, list):
                 mask_tensor = torch.stack(img_masks, dim=1).to(device)  # [B, S]
             else:
                 mask_tensor = img_masks.to(device)
                 
-            # 将 [B, S] 的图像级 mask 广播到 [B, S, N]
-            # 这意味着如果某张图片是 padding 的，那么它对应的所有 N 个 token 都会被 mask
+            # Broadcast [B, S] image-level mask to [B, S, N]
+            # This means if an image is padded, all N tokens corresponding to it will be masked
             pad_masks = pad_masks * mask_tensor.unsqueeze(-1)
 
-        # 4. Flatten 序列到 [B, S*N, D]
+        # 4. Flatten sequence to [B, S*N, D]
         img_emb = img_emb.reshape(B, S * N, D)
         pad_masks = pad_masks.reshape(B, S * N)
         
-        # 5. 构建 attention mask
-        # 第一个 token 置 1 建立 causal boundary，使 prefix 无法 attend 到 middle，
-        # 但 middle 可以 attend 到 prefix。这样推理时先处理 prefix（不含 middle 信息）
-        # 与训练行为一致，消除训练-推理 gap。
-        # 参考 InternVLA_A1_3B embed_middle: att_masks = [1] + [0] * (seq_len - 1)
+        # 5. Build attention mask
+        # Set the first token to 1 to establish a causal boundary, so that prefix cannot attend to middle,
+        # but middle can attend to prefix. This way during inference, prefix is processed first
+        # consistent with training behavior, eliminating train-inference gap.
+        # Reference embed_middle: att_masks = [1] + [0] * (seq_len - 1)
         seq_len = pad_masks.shape[1]
         att_masks = torch.zeros((B, seq_len), dtype=torch.bool, device=device)
-        att_masks[:, 0] = True  # 第一个 token 置 1，建立 causal boundary
+        att_masks[:, 0] = True  # Set the first token to 1 to establish a causal boundary
 
-        # 6. 维度映射到推理模型维度 (如 1024 或 2048)
+        # 6. Dimension mapping to inference model dimension
         img_emb = self.spatial_to_reasoning(img_emb)
 
         return img_emb, pad_masks, att_masks
@@ -475,7 +475,7 @@ class OmniVLA(nn.Module):
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        # 与 prefix/middle 一致用 bool，否则 torch.cat([prefix_att_masks, middle_att_masks, suffix_att_masks]) 会因 dtype 不一致报错
+        # Use bool consistent with prefix/middle, otherwise torch.cat will error due to dtype mismatch
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=embs.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
@@ -483,18 +483,18 @@ class OmniVLA(nn.Module):
 
     def get_position_ids(self, pad_masks):
         # pad_masks: [batch_size, total_seq_len] 
-        # 这里的 total_seq_len = prefix + middle + suffix 的总和
+        # Here total_seq_len is the sum of prefix + middle + suffix
         
         device = pad_masks.device
         seq_len = pad_masks.shape[1]
         
-        # 官方 PaliGemma 逻辑：不管你是图片还是文字，通通按顺序排队
-        # 生成 0, 1, 2, ..., total_seq_len - 1
+        # Official PaliGemma logic: whether it's image or text, line up in order
+        # Generate 0, 1, 2, ..., total_seq_len - 1
         position_ids = torch.arange(seq_len, dtype=torch.long, device=device)
         position_ids = position_ids.unsqueeze(0).expand_as(pad_masks)
         
-        # 注意：如果 pad_masks 包含 padding，这里也不用特意去填 0
-        # 因为 RoPE 会为每个位置生成旋转，而真正的“屏蔽”是靠 Attention Mask 实现的
+        # Note: if pad_masks contains padding, no need to specifically fill 0 here
+        # Because RoPE will generate rotation for each position, and the real 'masking' is achieved by Attention Mask
         return position_ids
 
     def _preprocess_observation(self, observation, *, train=True):
@@ -537,13 +537,13 @@ class OmniVLA(nn.Module):
         return actions
     
     def prepare_spatial_features(self, batch):
-        """用 VGGT 做空间特征（与 embed_spatial 一致）；若需其他 backbone 可在此扩展。"""
+        """Use VGGT for spatial features (consistent with embed_spatial); can be extended here if other backbones are needed."""
         images = torch.stack([batch[f"{OBS_IMAGES}.image{i}"] for i in range(3)], dim=1)  # B, N_view, T, C, H, W
         B, N_view, T = images.shape[:3]
         images = rearrange(images, "b n t c h w -> (b n t) c h w")
         images = F.interpolate(images, size=(256, 256), mode="bilinear", align_corners=False)
         images = images * 2 - 1
-        # VGGT 需要 [B, S, C, H, W]
+        # VGGT requires [B, S, C, H, W]
         images_5d = rearrange(images, "(b n t) c h w -> b (n t) c h w", b=B, n=N_view, t=T)
         with torch.no_grad():
             res = self.reasoning_spatial_expert.vggt_encoder(images_5d)
@@ -607,7 +607,7 @@ class OmniVLA(nn.Module):
             forward_func, prefix_embs, middle_embs, suffix_embs, att_2d_masks_4d, position_ids
         )
 
-        # 步长36临时设定，后续可改为动态配置
+        # Step length temporarily set, can be changed to dynamic configuration later
         suffix_out = suffix_out[:, -self.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
 
@@ -628,10 +628,10 @@ class OmniVLA(nn.Module):
     @torch.no_grad()
     def sample_actions(self, observation, device=None, noise=None, num_steps: int = 10) -> Tensor:
         """
-        推理版采样：使用 KV cache 加速推理。
-        1. 先处理 prefix（语言+图像），得到 past_key_values
-        2. 再处理 middle（空间特征），复用 prefix 的 KV cache
-        3. 去噪循环中，每次只处理 suffix，复用 prefix 和 middle 的 KV cache
+        Inference sampling: Use KV cache to accelerate inference.
+        1. Process prefix (language+image) first to get past_key_values
+        2. Process middle (spatial features) next, reusing prefix's KV cache
+        3. In the denoising loop, only process suffix each time, reusing prefix and middle's KV cache
         """
         if num_steps is None:
             num_steps = self.config.num_inference_steps
@@ -644,7 +644,7 @@ class OmniVLA(nn.Module):
         device = state.device
 
         if noise is None:
-            # 内部一直在 32 维动作空间做去噪，长度为 action_horizon
+            # Internally always denoising in the 32-dimensional action space, length is action_horizon
             actions_shape = (bsize, self.action_horizon, 32)
             noise = self.sample_noise(actions_shape, device)
 
@@ -654,12 +654,12 @@ class OmniVLA(nn.Module):
         x_t = noise.to(target_dtype)
         time = torch.tensor(1.0, dtype=target_dtype, device=device)
 
-        # 三个 expert 都用 eager 实现，避免 flash-attn 等实现差异
+        # All three experts use eager implementation to avoid differences in implementations like flash-attn
         self.reasoning_spatial_expert.reasoning_expert.language_model.config._attn_implementation = "eager"  # noqa: SLF001
         self.reasoning_spatial_expert.spatial_expert.config._attn_implementation = "eager"  # noqa: SLF001
         self.reasoning_spatial_expert.action_expert.config._attn_implementation = "eager"  # noqa: SLF001
 
-        # 1. 处理 prefix（语言+图像）
+        # 1. Process prefix (language+image)
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks
         )
@@ -667,11 +667,11 @@ class OmniVLA(nn.Module):
         prefix_position_ids = self.get_position_ids(prefix_pad_masks)
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
 
-        # 撤销推理时 GemmaModel 内部的 normalizer 缩放，以对齐训练逻辑
+        # Undo the normalizer scaling inside GemmaModel during inference to align with training logic
         normalizer = torch.tensor(prefix_embs.shape[-1]**0.5, dtype=prefix_embs.dtype, device=prefix_embs.device)
         prefix_embs_unscaled = prefix_embs / normalizer
 
-        # 处理 prefix，得到 past_key_values
+        # Process prefix, get past_key_values
         _, past_key_values = self.reasoning_spatial_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
@@ -681,7 +681,7 @@ class OmniVLA(nn.Module):
         )
         max_prefix_position_ids = prefix_position_ids.max(dim=-1, keepdim=True).values
 
-        # 2. 处理 middle（空间特征）
+        # 2. Process middle (spatial features)
         middle_embs, middle_pad_masks, middle_att_masks = self.embed_spatial(
             images, img_masks
         )
@@ -690,27 +690,27 @@ class OmniVLA(nn.Module):
         batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1]
         
-        # 构建 prefix + middle 的 attention mask
-        # 确保 middle 自身的 pad_masks 和 prefix 的 pad_masks 共同作用
+        # Build attention mask for prefix + middle
+        # Ensure middle's own pad_masks and prefix's pad_masks work together
         prefix_pad_2d_masks = middle_pad_masks[:, :, None] & prefix_pad_masks[:, None, :]
         middle_att_2d_masks = make_att_2d_masks(middle_pad_masks, middle_att_masks)
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, middle_att_2d_masks], dim=2)
 
-        # middle 的 position_ids 从 max_prefix_position_ids + 1 开始
-        # 对于单独调用 spatial_expert，需要 [batch_size, middle_len] 的形状
-        # 索引 1 对应 spatial_expert（reasoning=0, spatial=1, action=2）
+        # middle's position_ids start from max_prefix_position_ids + 1
+        # For calling spatial_expert individually, a shape of [batch_size, middle_len] is needed
+        # Index 1 corresponds to spatial_expert (reasoning=0, spatial=1, action=2)
         middle_position_ids_2d = torch.arange(1, middle_len + 1, dtype=torch.long, device=device)
         middle_position_ids_2d = middle_position_ids_2d.unsqueeze(0).expand(batch_size, -1)  # [batch_size, middle_len]
         middle_position_ids_2d = middle_position_ids_2d + max_prefix_position_ids  # [batch_size, 1] broadcasts to [batch_size, middle_len]
 
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
 
-        # 撤销推理时 GemmaModel 内部的 normalizer 缩放
+        # Undo normalizer scaling inside GemmaModel during inference
         normalizer_m = torch.tensor(middle_embs.shape[-1]**0.5, dtype=middle_embs.dtype, device=middle_embs.device)
         middle_embs_unscaled = middle_embs / normalizer_m
 
-        # 处理 middle，复用 prefix 的 KV cache
-        # 注意：单独调用 expert 时，position_ids 应该是 [batch_size, seq_len] 的形状
+        # Process middle, reuse prefix's KV cache
+        # Note: When calling expert individually, position_ids should be of shape [batch_size, seq_len]
         (_, middle_out, _), past_key_values = self.reasoning_spatial_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=middle_position_ids_2d,
@@ -719,11 +719,11 @@ class OmniVLA(nn.Module):
             use_cache=True,
         )
 
-        # 保存 max_position_ids 用于后续 suffix 的 position_ids 计算
+        # Save max_position_ids for subsequent position_ids calculation of suffix
         max_position_ids = middle_position_ids_2d.max(dim=-1, keepdim=True).values  # [batch_size, 1]
         curr_pad_masks = torch.cat([prefix_pad_masks, middle_pad_masks], dim=1)
 
-        # 3. 去噪循环：每次只处理 suffix，复用 prefix 和 middle 的 KV cache
+        # 3. Denoising loop: only process suffix each time, reusing prefix and middle's KV cache
         while time >= -dt / 2:
             expanded_time = time.expand(bsize).to(target_dtype)
             v_t = self.denoise_step(
@@ -748,13 +748,13 @@ class OmniVLA(nn.Module):
         x_t,
         timestep,
     ):
-        """单步去噪：只处理 suffix，复用 prefix 和 middle 的 KV cache。"""
-        # 1) 只生成 suffix embedding
+        """Single step denoising: only process suffix, reuse prefix and middle's KV cache."""
+        # 1) Only generate suffix embedding
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
             state, x_t, timestep
         )
 
-        # 与训练阶段一致的 dtype 处理
+        # Dtype processing consistent with the training phase
         if (
             self.reasoning_spatial_expert.reasoning_expert.language_model.model.layers[
                 0
@@ -763,21 +763,21 @@ class OmniVLA(nn.Module):
         ):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
 
-        # 2) 构建 attention mask
-        # 当使用 KV cache 时，transformers 会自动处理 attention mask
-        # 我们只需要为新序列（suffix）构建 attention mask
-        # transformers 内部会自动将其扩展到包含缓存序列的总长度
+        # 2) Build attention mask
+        # When using KV cache, transformers will automatically handle attention mask
+        # We only need to build attention mask for the new sequence (suffix)
+        # Transformers internally will automatically extend it to the total length including cached sequence
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
         
-        # 只构建 suffix 的 attention mask
+        # Only build attention mask for suffix
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
         
-        # 当使用 KV cache 时，需要构建包含缓存序列的完整 attention mask
-        # 从 past_key_values 获取实际的缓存序列长度
+        # When using KV cache, a complete attention mask including cached sequence needs to be built
+        # Get actual cached sequence length from past_key_values
         if past_key_values is not None:
             cached_seq_len = past_key_values.get_seq_length()
-            # 为了防止在去噪循环中修改被复用的 cache
+            # To prevent modifying the reused cache in the denoising loop
             from transformers.cache_utils import DynamicCache
             past_key_values_copy = DynamicCache()
             past_key_values_copy.key_cache = list(past_key_values.key_cache)
@@ -788,17 +788,17 @@ class OmniVLA(nn.Module):
             cached_seq_len = 0
             past_key_values_copy = None
         
-        # 构建完整的 attention mask：[batch_size, suffix_len, cached_seq_len + suffix_len]
+        # Build complete attention mask: [batch_size, suffix_len, cached_seq_len + suffix_len]
         if cached_seq_len > 0:
-            # 考虑被缓存序列中的 padding
+            # Consider padding in the cached sequence
             cached_mask = suffix_pad_masks[:, :, None] & prefix_pad_masks[:, None, :cached_seq_len]
             full_att_2d_masks = torch.cat([cached_mask, suffix_att_2d_masks], dim=2)
         else:
             full_att_2d_masks = suffix_att_2d_masks
 
-        # suffix 的 position_ids 从 max_position_ids + 1 开始
-        # 对于单独调用 action_expert，需要 [batch_size, suffix_len] 的形状
-        # 索引 2 对应 action_expert（reasoning=0, spatial=1, action=2）
+        # suffix's position_ids start from max_position_ids + 1
+        # For calling action_expert individually, a shape of [batch_size, suffix_len] is needed
+        # Index 2 corresponds to action_expert (reasoning=0, spatial=1, action=2)
         device = suffix_embs.device
         position_ids = torch.arange(1, suffix_len + 1, dtype=torch.long, device=device)
         position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)  # [batch_size, suffix_len]
@@ -806,20 +806,20 @@ class OmniVLA(nn.Module):
 
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
 
-        # 撤销推理时 GemmaModel 内部的 normalizer 缩放
+        # Undo normalizer scaling inside GemmaModel during inference
         normalizer_s = torch.tensor(suffix_embs.shape[-1]**0.5, dtype=suffix_embs.dtype, device=suffix_embs.device)
         suffix_embs_unscaled = suffix_embs / normalizer_s
 
-        # 3) 只处理 suffix，复用 prefix 和 middle 的 KV cache
+        # 3) Only process suffix, reuse prefix and middle's KV cache
         outputs_embeds, _ = self.reasoning_spatial_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
             past_key_values=past_key_values_copy,
             inputs_embeds=[None, None, suffix_embs_unscaled],
-            use_cache=False,  # suffix 每次都在变，不需要 cache
+            use_cache=False,  # suffix changes every time, no cache needed
         )
 
-        # 4) 取出与训练 loss 一致的后 action_horizon 个 token，并投影回动作空间
+        # 4) Extract the last action_horizon tokens consistent with training loss, and project back to action space
         suffix_out = outputs_embeds[2]
         suffix_out = suffix_out[:, -self.action_horizon :]
         suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)

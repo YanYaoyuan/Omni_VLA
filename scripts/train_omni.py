@@ -205,10 +205,10 @@ def load_g2vlm_weights_from_checkpoint(model, model_path: str, device: torch.dev
 # add for wandb image logging
 def normalize_to_hwc(img: torch.Tensor, cam_name: str):
     """
-    支持:
+    Supports:
       [C, H, W]
       [H, W, C]
-    返回:
+    Returns:
       [H, W, 3]
     """
     assert img.ndim == 3, f"{cam_name} ndim={img.ndim}"
@@ -217,14 +217,14 @@ def normalize_to_hwc(img: torch.Tensor, cam_name: str):
         # CHW -> HWC
         img = img.permute(1, 2, 0)
     elif img.shape[-1] in (1, 3):
-        # 已经是 HWC
+        # Already HWC
         pass
     else:
         raise ValueError(
             f"{cam_name} unknown image shape {tuple(img.shape)}"
         )
 
-    # 保证 3 通道
+    # Ensure 3 channels
     if img.shape[-1] == 1:
         img = img.repeat(1, 1, 3)
     elif img.shape[-1] > 3:
@@ -578,10 +578,10 @@ def train_loop(config: _config.TrainConfig):
                 single = normalize_to_hwc(single, cam_name)
                 cam_imgs.append(single)
 
-            img_concatenated = torch.cat(cam_imgs, dim=1)  # 拼宽度
+            img_concatenated = torch.cat(cam_imgs, dim=1)  # Concatenate width
 
             print("wandb image shape:", img_concatenated.shape)
-            # 必须是 (224, 672, 3)
+            # Must be (224, 672, 3)
 
             images_to_log.append(
                 wandb.Image(img_concatenated.cpu().numpy())
@@ -758,23 +758,23 @@ def train_loop(config: _config.TrainConfig):
         else None
     )
 
-    # 打印一下看看，确保只有专家层和 Proj 层在训练
+    # Print to ensure only expert layers and Proj layers are training
     for name, param in model.named_parameters():
         if param.requires_grad:
             print(f"Training: {name}")
 
     # Prepare inputs
-    # 兼容单 GPU / DDP
+    # Compatible with single GPU / DDP
     model_to_use = getattr(model, "module", model)
 
-    # 总参数
+    # Total parameters
     total_params = sum(p.numel() for p in model_to_use.parameters())
     trainable_params = sum(p.numel() for p in model_to_use.parameters() if p.requires_grad)
 
     print(f"\nTotal parameters: {total_params:,}  ({total_params / 1e9:.2f}B)")
     print(f"Trainable parameters: {trainable_params:,}  ({trainable_params / 1e9:.2f}B)")
 
-    # 专家模块参数
+    # Expert module parameters
     print(f"Reasoning params: {sum(p.numel() for p in model_to_use.reasoning_spatial_expert.reasoning_expert.parameters()) / 1e9:.2f}B")
     print(f"Spatial params: {sum(p.numel() for p in model_to_use.reasoning_spatial_expert.spatial_expert.parameters()) / 1e9:.2f}B")
     print(f"Action params: {sum(p.numel() for p in model_to_use.reasoning_spatial_expert.action_expert.parameters()) / 1e9:.2f}B")
@@ -811,25 +811,25 @@ def train_loop(config: _config.TrainConfig):
             elif not isinstance(losses, torch.Tensor):
                 losses = torch.tensor(losses, device=device, dtype=torch.float32)
             
-            # --- 替换报错部分的 NaN 诊断代码 ---
+            # --- Replace NaN diagnostic code for error reporting ---
             if torch.isnan(losses).any():
                 print("\n" + "!"*50)
-                print("检测到 Loss 为 NaN! 正在自动诊断...")
+                print("NaN loss detected! Auto-diagnosing...")
                 
-                # 1. 检查 Actions 输入
+                # 1. Check Actions input
                 if torch.isnan(actions).any():
-                    print("错误：输入 actions 包含 NaN")
+                    print("Error: input actions contain NaN")
                 
-                # 2. 检查模型参数梯度（如果是回传后 NaN）
+                # 2. Check model parameter gradients (if NaN after backward pass)
                 for name, param in model.named_parameters():
                     if param.grad is not None and torch.isnan(param.grad).any():
-                        print(f"梯度异常：层 {name} 的梯度包含 NaN")
+                        print(f"Gradient anomaly: layer {name} gradient contains NaN")
                 
-                # 3. 检查 Attention Mask
-                # 建议在模型 forward 内部也打印一下 attention_mask.min()
+                # 3. Check Attention Mask
+                # It is recommended to also print attention_mask.min() inside the model forward pass
                 
                 print("!"*50 + "\n")
-                # 抛出异常停止程序，防止污染之后的 checkpoint
+                # Raise exception to stop program and prevent corrupting subsequent checkpoints
                 raise RuntimeError("Stopping due to NaN loss")
 
             loss = losses.mean()
