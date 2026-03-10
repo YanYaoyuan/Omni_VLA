@@ -16,10 +16,6 @@ from openpi.vlm_expert.dinov2_with_registers.modular_dinov2_with_registers impor
 
 import os
 
-MODEL_PATH = "/root/autodl-tmp/huggingface/lerobot/pi0_torch_libero/pi0_torch_libero/model.safetensors"
-
-VGGT_PRETRAINED_PATH = "/root/autodl-tmp/huggingface/lerobot/VGGT-1B/model.safetensors"
-
 # Define the complete layer computation function for gradient checkpointing
 def compute_layer_complete(
     layer_idx, inputs_embeds, attention_mask, position_ids, reasoning_expert, spatial_expert, action_expert
@@ -147,6 +143,8 @@ class VLMWithSpatialActionExpertModel(
         vlm_config,
         spatial_expert_config,
         action_expert_config,
+        vlm_pretrained_path: str | None = None,
+        vggt_pretrained_path: str | None = None,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
     ):
         super().__init__()

@@ -28,6 +28,14 @@ class OmniConfig(_pi0_config.Pi0Config):
     pretrained_g2vlm_path : str = '/data/openpi_temp/checkpoints/pi0_libero_low_mem_finetune/omni_9/30000'  # checkpoint or HF repo
     g2vlm_config_path : str = "/home/user/robot/model/G2VLM-2B-MoT"  # checkpoint or HF repo
 
+    vlm_pretrained_path: Optional[str] = "/root/autodl-tmp/huggingface/lerobot/pi0_torch_libero/pi0_torch_libero/model.safetensors"
+    vggt_pretrained_path: Optional[str] = "/root/autodl-tmp/huggingface/lerobot/VGGT-1B/model.safetensors"
+
+    # ------------------------------------------------------------------
+    # OmniVLA Pretrained Checkpoint (for fine-tuning)
+    # ------------------------------------------------------------------
+    omni_pretrained_path: Optional[str] = None
+
     action_dim: int = 32
     action_horizon: int = 50
 

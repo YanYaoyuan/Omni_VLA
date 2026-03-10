@@ -638,6 +638,23 @@ def train_loop(config: _config.TrainConfig):
     g2_model_path = '/home/user/robot/model/G2VLM-2B-MoT'
     model = OmniVLA(config=model_cfg, device=device)
 
+    # Load pretrained OmniVLA weights for fine-tuning
+    if hasattr(model_cfg, "omni_pretrained_path") and model_cfg.omni_pretrained_path:
+        ckpt_path = model_cfg.omni_pretrained_path
+        if os.path.isdir(ckpt_path):
+            ckpt_path = os.path.join(ckpt_path, "model.safetensors")
+        if os.path.exists(ckpt_path):
+            logging.info(f"Loading pretrained OmniVLA weights from {ckpt_path} for fine-tuning...")
+            state_dict = safetensors.torch.load_file(ckpt_path, device="cpu")
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            logging.info(f"Loaded OmniVLA weights. Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+            if missing:
+                logging.warning(f"Missing keys (first 20): {missing[:20]}")
+            if unexpected:
+                logging.warning(f"Unexpected keys (first 20): {unexpected[:20]}")
+        else:
+            logging.warning(f"Pretrained OmniVLA path {ckpt_path} does not exist! Skipping loading.")
+
     model = model.to(device)
 
 
